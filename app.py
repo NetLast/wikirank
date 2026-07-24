@@ -156,6 +156,7 @@ T = {
    f_of="Формула конкурсу:", saved="Збережено ✓",
    articles_btn="Статті", no_articles="У межах конкурсу немає редагувань статей.",
    created="створено", expanded="доповнено",
+   view="Переглянути", open_article="Відкрити статтю", loading="Завантаження…",
    footer="Кількісний внесок = сума доданих байтів через API MediaWiki."),
  "en": dict(brand="WikiRank", tagline="Contribution analysis for wiki contests. Admins and jury only.",
    login="Login", password="Password", signin="Sign in", bad="Wrong login or password",
@@ -190,6 +191,7 @@ T = {
    f_of="Contest formula:", saved="Saved ✓",
    articles_btn="Articles", no_articles="No article edits within the contest scope.",
    created="created", expanded="expanded",
+   view="View", open_article="Open article", loading="Loading…",
    footer="Quantitative contribution = sum of added bytes via the MediaWiki API."),
  "pl": dict(brand="WikiRank", tagline="Analiza wkładu uczestników konkursów wiki. Dostęp tylko dla adminów i jury.",
    login="Login", password="Hasło", signin="Zaloguj się", bad="Nieprawidłowy login lub hasło",
@@ -224,6 +226,7 @@ T = {
    f_of="Formuła konkursu:", saved="Zapisano ✓",
    articles_btn="Artykuły", no_articles="Brak edycji artykułów w ramach konkursu.",
    created="utworzono", expanded="rozbudowano",
+   view="Zobacz", open_article="Otwórz artykuł", loading="Ładowanie…",
    footer="Wkład ilościowy = suma dodanych bajtów przez API MediaWiki."),
 }
 
@@ -554,6 +557,69 @@ async function saveComment(user,article){
 }
 let ARTOPEN=null;
 function articleLink(origin,title){return origin+'/wiki/'+encodeURIComponent(title.replace(/ /g,'_'))}
+
+// ── Модальне прев'ю статті: превʼю зліва, оцінка/коментарі справа ──
+let MODAL=null; // {user,title,origin,host,api,label,bytes,created}
+const EXTRACT_CACHE={};
+async function openArticle(user,title,origin,host,api,label,bytes,created){
+ MODAL={user,title,origin,host,api,label,bytes,created};
+ renderModal();
+ const key=host+'::'+title;
+ if(!EXTRACT_CACHE[key]){
+  EXTRACT_CACHE[key]='loading';
+  try{
+   const d=await mw(api,{action:'query',prop:'extracts|pageimages',exintro:'1',explaintext:'1',
+    exchars:'700',piprop:'thumbnail',pithumbsize:'500',redirects:'1',titles:title});
+   const page=Object.values(d.query?.pages||{})[0];
+   EXTRACT_CACHE[key]={extract:page?.extract||'',thumb:page?.thumbnail?.source||null};
+  }catch(e){EXTRACT_CACHE[key]={extract:'',thumb:null,err:String(e.message||e)}}
+  if(MODAL&&MODAL.title===title&&MODAL.host===host)renderModal();
+ }
+}
+function closeModal(){MODAL=null;renderModal()}
+function renderModal(){
+ let el=document.getElementById('artModal');
+ if(!MODAL){if(el)el.remove();return}
+ if(!el){el=document.createElement('div');el.id='artModal';document.body.appendChild(el)}
+ const key=MODAL.host+'::'+MODAL.title;
+ const ex=EXTRACT_CACHE[key];
+ const ad=(ASSESS[MODAL.user]&&ASSESS[MODAL.user][MODAL.title])||{scores:{},comments:[]};
+ const vals=Object.values(ad.scores||{}).filter(v=>v!=null);
+ const avg=vals.length?(vals.reduce((x,y)=>x+y,0)/vals.length):null;
+ const my=(ad.scores||{})[JURY_LOGIN];
+ const cid=idFor(MODAL.user+'||'+MODAL.title);
+ let h='<div style="position:fixed;inset:0;background:rgba(16,24,32,.6);z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px" onclick="if(event.target===this)closeModal()">';
+ h+='<div style="background:#fff;border-radius:14px;max-width:920px;width:100%;max-height:92vh;overflow:auto;display:grid;grid-template-columns:1fr 1fr" onclick="event.stopPropagation()">';
+ h+='<div style="padding:22px;border-right:1px solid var(--line)">';
+ if(!ex||ex==='loading')h+='<div class="hint">'+T.loading+'</div>';
+ else if(ex.err)h+='<div class="hint">'+esc(ex.err)+'</div>';
+ else{
+  if(ex.thumb)h+='<img src="'+esc(ex.thumb)+'" alt="" style="max-width:100%;border-radius:8px;margin-bottom:10px;display:block">';
+  h+='<h3 style="margin:0 0 8px">'+esc(MODAL.title)+'</h3>';
+  h+='<div style="font-size:14px;line-height:1.55;white-space:pre-wrap">'+esc(ex.extract||'')+'</div>';
+ }
+ h+='<a class="btn-p" style="display:inline-block;margin-top:14px;text-decoration:none" target="_blank" rel="noopener" href="'+articleLink(MODAL.origin,MODAL.title)+'">'+T.open_article+' ↗</a>';
+ h+='</div>';
+ h+='<div style="padding:22px">';
+ h+='<button class="btn-s" style="float:right;padding:4px 10px" onclick="closeModal()">✕</button>';
+ h+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">';
+ h+='<span class="chip" style="background:'+(MODAL.created?'#e6f4ea':'var(--acc-soft)')+';color:'+(MODAL.created?'#1d7a4f':'var(--acc)')+'">'+(MODAL.created?T.created:T.expanded)+'</span>';
+ h+='<span class="hint mono">'+esc(MODAL.label)+' · +'+fmtN(MODAL.bytes)+(LANG==='uk'?' Б':' B')+'</span>';
+ h+='</div>';
+ h+='<div class="hint" style="margin:8px 0 4px">'+esc(MODAL.user)+'</div>';
+ h+='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px">';
+ h+='<label class="hint" style="font-size:12px">'+T.th_my+':</label>';
+ h+='<input type="number" step="0.1" style="width:70px" value="'+(my??'')+'" onchange="saveScore('+esc(JSON.stringify(MODAL.user))+','+esc(JSON.stringify(MODAL.title))+',this.value)">';
+ h+='<span class="hint mono">'+T.th_avg+': '+(avg!=null?avg.toFixed(2):'—')+(vals.length?' ('+vals.length+' '+T.scores_n+')':'')+'</span>';
+ h+='</div>';
+ h+='<div style="margin-top:14px">';
+ (ad.comments||[]).forEach(c=>{h+='<div style="padding:5px 0;border-bottom:1px dashed var(--line)"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span><div>'+esc(c.text)+'</div></div>'});
+ if(!(ad.comments||[]).length)h+='<div class="hint" style="font-size:12px">'+T.no_comments+'</div>';
+ h+='<div style="display:flex;gap:8px;margin-top:8px"><input id="cm_'+cid+'" placeholder="'+T.comment_ph+'" onkeydown="if(event.key===\\'Enter\\')saveComment('+esc(JSON.stringify(MODAL.user))+','+esc(JSON.stringify(MODAL.title))+')"><button class="btn-p" onclick="saveComment('+esc(JSON.stringify(MODAL.user))+','+esc(JSON.stringify(MODAL.title))+')">'+T.save+'</button></div>';
+ h+='</div>';
+ h+='</div></div></div>';
+ el.innerHTML=h;
+}
 function articleQuality(pa){
  if(!pa)return{quality:0,n:0};
  const avgs=[];let n=0;
@@ -608,31 +674,22 @@ function render(){
    h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:760px">';
    const items=[];
    projects.forEach(p=>{const pp=row.r?row.r.perProject[p.host]:null;
-    (pp&&pp.list?pp.list:[]).forEach(it=>items.push({...it,origin:p.origin,label:p.label}))});
+    (pp&&pp.list?pp.list:[]).forEach(it=>items.push({...it,origin:p.origin,label:p.label,host:p.host,api:p.api}))});
    items.sort((a,b2)=>b2.bytes-a.bytes);
    if(!items.length)h+='<div class="hint">'+T.no_articles+'</div>';
    items.forEach(it=>{
     const ad=(row.pa&&row.pa[it.title])||{scores:{},comments:[]};
     const vals=Object.values(ad.scores||{}).filter(v=>v!=null);
     const avg=vals.length?(vals.reduce((x,y)=>x+y,0)/vals.length):null;
-    const my=(ad.scores||{})[JURY_LOGIN];
-    const cid=idFor(row.user+'||'+it.title);
-    h+='<div style="padding:10px 0;border-bottom:1px dashed var(--line)">';
-    h+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">';
-    h+='<a class="wl" target="_blank" rel="noopener" href="'+articleLink(it.origin,it.title)+'">'+esc(it.title)+' ↗</a>';
+    const nCm=(ad.comments||[]).length;
+    h+='<div class="art-row" style="padding:8px 0;border-bottom:1px dashed var(--line);display:flex;align-items:center;gap:8px;flex-wrap:wrap;cursor:pointer" '+
+      'onclick="openArticle('+esc(JSON.stringify(row.user))+','+esc(JSON.stringify(it.title))+','+esc(JSON.stringify(it.origin))+','+esc(JSON.stringify(it.host))+','+esc(JSON.stringify(it.api))+','+esc(JSON.stringify(it.label))+','+it.bytes+','+(it.created?'true':'false')+')">';
+    h+='<b class="wl">'+esc(it.title)+'</b>';
     h+='<span class="chip" style="background:'+(it.created?'#e6f4ea':'var(--acc-soft)')+';color:'+(it.created?'#1d7a4f':'var(--acc)')+'">'+(it.created?T.created:T.expanded)+'</span>';
     h+='<span class="hint mono">'+it.label+' · +'+fmtN(it.bytes)+(LANG==='uk'?' Б':' B')+'</span>';
-    h+='</div>';
-    h+='<div style="display:flex;align-items:center;gap:10px;margin-top:6px;flex-wrap:wrap">';
-    h+='<label class="hint" style="font-size:12px">'+T.th_my+':</label>';
-    h+='<input type="number" step="0.1" style="width:70px" value="'+(my??'')+'" onchange="saveScore('+esc(JSON.stringify(row.user))+','+esc(JSON.stringify(it.title))+',this.value)">';
-    h+='<span class="hint mono">'+T.th_avg+': '+(avg!=null?avg.toFixed(2):'—')+(vals.length?' ('+vals.length+' '+T.scores_n+')':'')+'</span>';
-    h+='</div>';
-    h+='<div style="margin-top:6px">';
-    (ad.comments||[]).forEach(c=>{h+='<div style="padding:4px 0"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span><div>'+esc(c.text)+'</div></div>'});
-    if(!(ad.comments||[]).length)h+='<div class="hint" style="font-size:12px">'+T.no_comments+'</div>';
-    h+='<div style="display:flex;gap:8px;margin-top:4px"><input id="cm_'+cid+'" placeholder="'+T.comment_ph+'" onkeydown="if(event.key===\\'Enter\\')saveComment('+esc(JSON.stringify(row.user))+','+esc(JSON.stringify(it.title))+')"><button class="btn-p" style="padding:4px 10px;font-size:12px" onclick="saveComment('+esc(JSON.stringify(row.user))+','+esc(JSON.stringify(it.title))+')">'+T.save+'</button></div>';
-    h+='</div>';
+    if(avg!=null)h+='<span class="chip" style="background:var(--gold-soft,#fbf3e2);color:#b07a1e">'+T.th_avg+' '+avg.toFixed(2)+'</span>';
+    if(nCm)h+='<span class="hint" style="font-size:11px">💬 '+nCm+'</span>';
+    h+='<span class="hint" style="margin-left:auto;font-size:11px">'+T.view+' →</span>';
     h+='</div>';
    });
    h+='</div></td></tr>';
@@ -641,6 +698,7 @@ function render(){
  h+='</tbody></table>';
  el.innerHTML=h;
  document.getElementById('csvlink').href='/export/'+CID+'.csv?quant='+(QUANT?1:0)+'&qual='+(QUAL?1:0);
+ renderModal();
 }
 window.addEventListener('DOMContentLoaded',render);
 </script>
