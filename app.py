@@ -447,12 +447,12 @@ function render(){
    h+='<td class="mono" style="font-size:12px">'+(row.r?fmtN(row.r.edits)+' / '+fmtN(row.r.articles):'—')+'</td>';
   }
   if(QUAL){
-   h+='<td><input type="number" step="0.1" style="width:74px" value="'+(row.my??'')+'" onchange="saveScore('+JSON.stringify(row.user)+',this.value)"></td>';
+   h+='<td><input type="number" step="0.1" style="width:74px" value="'+(row.my??'')+'" onchange="saveScore('+esc(JSON.stringify(row.user))+',this.value)"></td>';
    h+='<td class="mono">'+(row.n?row.quality.toFixed(2):'—')+'<div class="hint">'+row.n+' '+T.scores_n+'</div></td>';
    h+='<td><span class="mono" style="font-weight:700;color:var(--gold);font-size:15px">'+(row.score!=null?row.score.toFixed(2):'—')+'</span></td>';
   }
-  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="ARTOPEN=ARTOPEN==='+JSON.stringify(row.user)+'?null:'+JSON.stringify(row.user)+';render()">'+T.articles_btn+(row.r?' ('+row.r.articles+')':'')+'</button>':'')+
-      (QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="EXPANDED=EXPANDED==='+JSON.stringify(row.user)+'?null:'+JSON.stringify(row.user)+';render()">'+T.comments+((row.a.comments||[]).length?' ('+row.a.comments.length+')':'')+'</button>':'')+'</td></tr>';
+  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="ARTOPEN=ARTOPEN==='+esc(JSON.stringify(row.user))+'?null:'+esc(JSON.stringify(row.user))+';render()">'+T.articles_btn+(row.r?' ('+row.r.articles+')':'')+'</button>':'')+
+      (QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="EXPANDED=EXPANDED==='+esc(JSON.stringify(row.user))+'?null:'+esc(JSON.stringify(row.user))+';render()">'+T.comments+((row.a.comments||[]).length?' ('+row.a.comments.length+')':'')+'</button>':'')+'</td></tr>';
   if(QUAL&&ARTOPEN===row.user){
    h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:640px">';
    const items=[];
@@ -473,7 +473,7 @@ function render(){
    h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:640px">';
    (row.a.comments||[]).forEach(c=>{h+='<div style="padding:6px 0;border-bottom:1px dashed var(--line)"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span><div>'+esc(c.text)+'</div></div>'});
    if(!(row.a.comments||[]).length)h+='<div class="hint">'+T.no_comments+'</div>';
-   h+='<div style="display:flex;gap:8px;margin-top:8px"><input id="cm_'+idFor(row.user)+'" placeholder="'+T.comment_ph+'" onkeydown="if(event.key===\\'Enter\\')saveComment('+JSON.stringify(row.user)+')"><button class="btn-p" onclick="saveComment('+JSON.stringify(row.user)+')">'+T.save+'</button></div>';
+   h+='<div style="display:flex;gap:8px;margin-top:8px"><input id="cm_'+idFor(row.user)+'" placeholder="'+T.comment_ph+'" onkeydown="if(event.key===\\'Enter\\')saveComment('+esc(JSON.stringify(row.user))+')"><button class="btn-p" onclick="saveComment('+esc(JSON.stringify(row.user))+')">'+T.save+'</button></div>';
    h+='</div></td></tr>';
   }
  });
