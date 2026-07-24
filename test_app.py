@@ -255,49 +255,93 @@ class TestAssessment:
     def test_score_save_update_delete(self, admin):
         c = make_contest(admin, "Оцінки")
         cid = c["id"]
-        admin.post("/api/score", json={"contest": cid,
-                                       "participant": "Учасник1", "value": 7})
-        admin.post("/api/score", json={"contest": cid,
-                                       "participant": "Учасник1", "value": 9})
+        admin.post("/api/score", json={"contest": cid, "participant": "Учасник1",
+                                       "article": "Стаття А", "value": 7})
+        admin.post("/api/score", json={"contest": cid, "participant": "Учасник1",
+                                       "article": "Стаття А", "value": 9})
         st = admin.get(f"/api/state/{cid}").get_json()
-        assert st["assess"]["Учасник1"]["scores"]["admin"] == 9
+        assert st["assess"]["Учасник1"]["Стаття А"]["scores"]["admin"] == 9
         # value=null видаляє оцінку
-        admin.post("/api/score", json={"contest": cid,
-                                       "participant": "Учасник1", "value": None})
+        admin.post("/api/score", json={"contest": cid, "participant": "Учасник1",
+                                       "article": "Стаття А", "value": None})
         st = admin.get(f"/api/state/{cid}").get_json()
-        assert "admin" not in st["assess"].get("Учасник1", {}).get("scores", {})
+        assert "admin" not in st["assess"].get("Учасник1", {}).get("Стаття А", {}).get("scores", {})
+
+    def test_scores_independent_per_article(self, admin):
+        c = make_contest(admin, "Незалежні статті")
+        cid = c["id"]
+        admin.post("/api/score", json={"contest": cid, "participant": "Учасник1",
+                                       "article": "Стаття А", "value": 5})
+        admin.post("/api/score", json={"contest": cid, "participant": "Учасник1",
+                                       "article": "Стаття Б", "value": 9})
+        st = admin.get(f"/api/state/{cid}").get_json()
+        assess = st["assess"]["Учасник1"]
+        assert assess["Стаття А"]["scores"]["admin"] == 5
+        assert assess["Стаття Б"]["scores"]["admin"] == 9
 
     def test_average_of_two_juries(self, admin):
         c = make_contest(admin, "Середнє")
         cid = c["id"]
         make_jury(admin, "j_avg", "pw1234", "Друге Журі")
-        admin.post("/api/score", json={"contest": cid,
-                                       "participant": "Учасник2", "value": 6})
+        admin.post("/api/score", json={"contest": cid, "participant": "Учасник2",
+                                       "article": "Стаття А", "value": 6})
         login_as(admin, "j_avg", "pw1234")
-        admin.post("/api/score", json={"contest": cid,
-                                       "participant": "Учасник2", "value": 10})
+        admin.post("/api/score", json={"contest": cid, "participant": "Учасник2",
+                                       "article": "Стаття А", "value": 10})
         st = admin.get(f"/api/state/{cid}").get_json()
-        scores = st["assess"]["Учасник2"]["scores"]
+        scores = st["assess"]["Учасник2"]["Стаття А"]["scores"]
         assert sorted(scores.values()) == [6, 10]
+
+    def test_quality_is_mean_of_article_means(self, admin):
+        # Учасник1: стаття А середня 6 (журі 4 і 8), стаття Б середня 10 (одне журі)
+        # якість = (6 + 10) / 2 = 8, а не пласке середнє (4+8+10)/3
+        c = make_contest(admin, "Формула якості")
+        cid = c["id"]
+        make_jury(admin, "j2", "pw1234", "Журі 2")
+        admin.post("/api/score", json={"contest": cid, "participant": "Учасник1",
+                                       "article": "Стаття А", "value": 4})
+        login_as(admin, "j2", "pw1234")
+        admin.post("/api/score", json={"contest": cid, "participant": "Учасник1",
+                                       "article": "Стаття А", "value": 8})
+        admin.post("/api/score", json={"contest": cid, "participant": "Учасник1",
+                                       "article": "Стаття Б", "value": 10})
+        with wr.app.app_context():
+            assess = wr.get_assess(cid)
+        quality, n = wr.article_quality(assess["Учасник1"])
+        assert quality == 8
+        assert n == 3
 
     def test_comment_saved_with_author_and_date(self, admin):
         c = make_contest(admin, "Коментарі")
         cid = c["id"]
         admin.post("/api/comment", json={
-            "contest": cid, "participant": "UserThree",
+            "contest": cid, "participant": "UserThree", "article": "Стаття А",
             "text": "Гарні описи маршрутів"})
         st = admin.get(f"/api/state/{cid}").get_json()
-        cm = st["assess"]["UserThree"]["comments"][0]
+        cm = st["assess"]["UserThree"]["Стаття А"]["comments"][0]
         assert cm["text"] == "Гарні описи маршрутів"
         assert cm["jury"] == "Admin"
         assert len(cm["date"]) == 16  # YYYY-MM-DD HH:MM
 
+    def test_comments_independent_per_article(self, admin):
+        c = make_contest(admin, "Коментарі по статтях")
+        cid = c["id"]
+        admin.post("/api/comment", json={"contest": cid, "participant": "UserThree",
+                                         "article": "Стаття А", "text": "про статтю А"})
+        admin.post("/api/comment", json={"contest": cid, "participant": "UserThree",
+                                         "article": "Стаття Б", "text": "про статтю Б"})
+        st = admin.get(f"/api/state/{cid}").get_json()
+        assess = st["assess"]["UserThree"]
+        assert assess["Стаття А"]["comments"][0]["text"] == "про статтю А"
+        assert assess["Стаття Б"]["comments"][0]["text"] == "про статтю Б"
+
     def test_comment_length_limited(self, admin):
         c = make_contest(admin, "Довгий")
         admin.post("/api/comment", json={
-            "contest": c["id"], "participant": "Учасник1", "text": "x" * 5000})
+            "contest": c["id"], "participant": "Учасник1",
+            "article": "Стаття А", "text": "x" * 5000})
         st = admin.get(f"/api/state/{c['id']}").get_json()
-        assert len(st["assess"]["Учасник1"]["comments"][0]["text"]) == 2000
+        assert len(st["assess"]["Учасник1"]["Стаття А"]["comments"][0]["text"]) == 2000
 
     def test_results_roundtrip(self, admin):
         c = make_contest(admin, "Результати")
@@ -325,10 +369,10 @@ class TestExport:
                 "bytes": 1000, "edits": 5, "articles": 3},
             "Учасник2": {"perProject": {}, "bytes": 50, "edits": 1, "articles": 1},
         })
-        admin.post("/api/score", json={"contest": cid,
-                                       "participant": "Учасник1", "value": 8})
-        admin.post("/api/comment", json={"contest": cid,
-                                         "participant": "Учасник1",
+        admin.post("/api/score", json={"contest": cid, "participant": "Учасник1",
+                                       "article": "Стаття А", "value": 8})
+        admin.post("/api/comment", json={"contest": cid, "participant": "Учасник1",
+                                         "article": "Стаття А",
                                          "text": "чудова робота"})
         return cid
 
