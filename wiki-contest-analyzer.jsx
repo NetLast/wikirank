@@ -61,6 +61,8 @@ const T = {
     thUser: "Учасник", thBytes: "Додано байтів", thEdits: "Ред. / стор.",
     thMy: "Моя оцінка", thAvg: "Сер. якість", thScore: "Бал за формулою",
     scores: "оцін.", comments: "Коментарі", noComments: "Коментарів ще немає.",
+    articlesBtn: "Статті", noArticles: "У межах конкурсу немає редагувань статей.",
+    created: "створено", expanded: "доповнено",
     commentPh: "Ваш коментар до внеску учасника…",
     error: "помилка",
     noParticipants: "У цьому конкурсі ще немає учасників — адмін може додати їх у налаштуваннях.",
@@ -121,6 +123,8 @@ const T = {
     thUser: "Participant", thBytes: "Bytes added", thEdits: "Edits / pages",
     thMy: "My score", thAvg: "Avg quality", thScore: "Formula score",
     scores: "score(s)", comments: "Comments", noComments: "No comments yet.",
+    articlesBtn: "Articles", noArticles: "No article edits within the contest scope.",
+    created: "created", expanded: "expanded",
     commentPh: "Your comment on this participant's contribution…",
     error: "error",
     noParticipants: "No participants in this contest yet — an admin can add them in settings.",
@@ -134,6 +138,14 @@ const T = {
     csvScore: "Formula score", csvComments: "Comments",
   },
 };
+
+// анонімний редактор: IPv4, IPv6 або замаскований тимчасовий обліковий запис (~2024-1…)
+function isAnon(u) {
+  if (/^~/.test(u)) return true;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(u)) return true;
+  if (/^[0-9a-f]{1,4}(::?[0-9a-f]{0,4}){2,7}$/i.test(u)) return true;
+  return false;
+}
 
 // простий хеш пароля (демонстраційний рівень захисту)
 const hash = (s) => {
@@ -185,7 +197,7 @@ async function fetchContribs(api, user, startISO, endISO) {
       list: "usercontribs",
       ucuser: user,
       uclimit: "500",
-      ucprop: "title|timestamp|sizediff|ids",
+      ucprop: "title|timestamp|sizediff|ids|flags",
       format: "json",
       origin: "*",
     });
@@ -485,7 +497,7 @@ function ContestAdmin({ contests, setContests, t }) {
         setExtLabel(pages[i]);
         const editors = await fetchPageEditors(tp.api, pages[i], startISO, endISO);
         editors.forEach((u) => {
-          if (!/bot$|бот$/i.test(u.trim())) users.add(u);
+          if (!/bot$|бот$/i.test(u.trim()) && !isAnon(u.trim())) users.add(u);
         });
         setExtDone(i + 1);
       }
@@ -697,6 +709,7 @@ function Analysis({ contest, me, t, lang }) {
   const [runLabel, setRunLabel] = useState("");
   const [drafts, setDrafts] = useState({});
   const [expanded, setExpanded] = useState(null);
+  const [artOpen, setArtOpen] = useState(null);
 
   const projects = useMemo(() => contest.projects.map(projectInfo).filter(Boolean), [contest]);
 
@@ -732,11 +745,18 @@ function Analysis({ contest, me, t, lang }) {
         try {
           const contribs = await fetchContribs(pr.api, user, startISO, endISO);
           let bytes = 0;
+          const detail = {};
           contribs.forEach((c) => {
             if (c.sizediff > 0) bytes += c.sizediff;
             titles.add(pr.host + "::" + c.title);
+            if (!detail[c.title]) detail[c.title] = { bytes: 0, created: false };
+            if (c.sizediff > 0) detail[c.title].bytes += c.sizediff;
+            if ("new" in c) detail[c.title].created = true;
           });
-          row.perProject[pr.host] = { bytes, edits: contribs.length, articles: new Set(contribs.map((c) => c.title)).size };
+          const list = Object.entries(detail)
+            .map(([title, d]) => ({ title, bytes: d.bytes, created: d.created }))
+            .sort((a, b) => b.bytes - a.bytes);
+          row.perProject[pr.host] = { bytes, edits: contribs.length, articles: new Set(contribs.map((c) => c.title)).size, list };
           row.bytes += bytes;
           row.edits += contribs.length;
         } catch (e) {
@@ -826,6 +846,7 @@ function Analysis({ contest, me, t, lang }) {
 
   // Special:Contributions працює у будь-якому мовному розділі MediaWiki
   const contribLink = (origin, user) => origin + "/wiki/Special:Contributions/" + encodeURIComponent(user);
+  const articleLink = (origin, title) => origin + "/wiki/" + encodeURIComponent(title.replace(/ /g, "_"));
 
   return (
     <div style={{ display: "grid", gap: 14 }}>
@@ -931,6 +952,12 @@ function Analysis({ contest, me, t, lang }) {
                   )}
                   <td>
                     {qual && (
+                      <button className="btn-s" style={{ padding: "4px 10px", fontSize: 12, marginRight: 6 }}
+                        onClick={() => setArtOpen(artOpen === row.user ? null : row.user)}>
+                        {t.articlesBtn}{row.r ? ` (${row.r.articles})` : ""}
+                      </button>
+                    )}
+                    {qual && (
                       <button className="btn-s" style={{ padding: "4px 10px", fontSize: 12 }}
                         onClick={() => setExpanded(expanded === row.user ? null : row.user)}>
                         {t.comments}{row.a.comments?.length ? ` (${row.a.comments.length})` : ""}
@@ -938,6 +965,32 @@ function Analysis({ contest, me, t, lang }) {
                     )}
                   </td>
                 </tr>
+                {qual && artOpen === row.user && (() => {
+                  const items = [];
+                  projects.forEach((p) => {
+                    const pp = row.r?.perProject?.[p.host];
+                    (pp?.list || []).forEach((it) => items.push({ ...it, origin: p.origin, label: p.label }));
+                  });
+                  items.sort((a, b) => b.bytes - a.bytes);
+                  return (
+                    <tr>
+                      <td colSpan={99} style={{ background: "#fafbfc" }}>
+                        <div style={{ maxWidth: 640 }}>
+                          {!items.length && <div className="hint">{t.noArticles}</div>}
+                          {items.map((it, j) => (
+                            <div key={j} style={{ padding: "6px 0", borderBottom: "1px dashed var(--line)", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                              <a className="wl" target="_blank" rel="noopener noreferrer" href={articleLink(it.origin, it.title)}>{it.title} ↗</a>
+                              <span className="chip" style={{ background: it.created ? "#e6f4ea" : "var(--acc-soft)", color: it.created ? "#1d7a4f" : "var(--acc)" }}>
+                                {it.created ? t.created : t.expanded}
+                              </span>
+                              <span className="hint mono">{it.label} · +{fmt(it.bytes, lang)}{lang === "uk" ? " Б" : " B"}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })()}
                 {qual && expanded === row.user && (
                   <tr>
                     <td colSpan={99} style={{ background: "#fafbfc" }}>
