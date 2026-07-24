@@ -78,6 +78,9 @@ CREATE TABLE IF NOT EXISTS article_comments(
 def init_db():
     con = sqlite3.connect(DB_PATH)
     con.executescript(SCHEMA)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(contests)")]
+    if "tpl_talk_only" not in cols:
+        con.execute("ALTER TABLE contests ADD COLUMN tpl_talk_only INTEGER DEFAULT 0")
     cur = con.execute("SELECT COUNT(*) c FROM users")
     if cur.fetchone()[0] == 0:
         con.execute("INSERT INTO users VALUES(?,?,?,?)",
@@ -375,36 +378,64 @@ async function fetchContribs(api,user,startISO,endISO){
   all.push(...(d.query?.usercontribs||[]));cont=d.continue?.uccontinue||null;g++;
  }while(cont&&g<10);return all;
 }
+// парсить посилання на шаблон конкурсу -> {api, title, host}
+function templateInfo(url){
+ try{
+  const u=new URL(url.trim());
+  const m=u.pathname.match(/\\/wiki\\/(.+)$/);if(!m)return null;
+  return{api:u.origin+'/w/api.php',title:decodeURIComponent(m[1]).replace(/_/g,' '),host:u.hostname};
+ }catch(e){return null}
+}
+// офіційні конкурсні статті за шаблоном (з урахуванням "лише обговорення")
+async function templatePages(tp,talkOnly){
+ let cont=null,raw=[],g=0;
+ do{const params={action:'query',list:'embeddedin',eititle:tp.title,eilimit:'500',einamespace:talkOnly?'1':'0|1'};
+  if(cont)params.eicontinue=cont;const d=await mw(tp.api,params);
+  raw.push(...(d.query?.embeddedin||[]));cont=d.continue?.eicontinue||null;g++;
+ }while(cont&&g<10);
+ const nsd=await mw(tp.api,{action:'query',meta:'siteinfo',siprop:'namespaces'});
+ const talkPfx=(nsd.query?.namespaces?.['1']?.['*']||'Talk')+':';
+ const pageSet=new Set();
+ raw.forEach(x=>pageSet.add(x.ns===1?x.title.slice(talkPfx.length):x.title));
+ return[...pageSet];
+}
+// повна історія редагувань статті з обчисленим приростом байтів на редагування
+async function pageRevisionsWithDiff(api,title){
+ let cont=null,all=[],g=0;
+ do{
+  const params={action:'query',prop:'revisions',titles:title,
+   rvprop:'user|timestamp|size|flags',rvlimit:'500',rvdir:'older'};
+  if(cont)params.rvcontinue=cont;
+  const d=await mw(api,params);
+  const page=Object.values(d.query?.pages||{})[0];
+  all.push(...(page?.revisions||[]));
+  cont=d.continue?.rvcontinue||null;g++;
+ }while(cont&&g<10);
+ for(let i=0;i<all.length;i++){
+  const older=all[i+1];
+  all[i].diff=older?(all[i].size-older.size):all[i].size;
+ }
+ return all;
+}
 </script>
 {% if view=='admin' and me.role=='admin' %}
 <script>
 async function extractParticipants(){
  const url=document.getElementById('tpl').value.trim();
  const msg=document.getElementById('extmsg'),bar=document.getElementById('extbar');
- let u;try{u=new URL(url)}catch(e){msg.textContent='✗ URL';return}
- const m=u.pathname.match(/\\/wiki\\/(.+)$/);if(!m){msg.textContent='✗ URL';return}
- const api=u.origin+'/w/api.php',title=decodeURIComponent(m[1]).replace(/_/g,' ');
+ const tp=templateInfo(url);if(!tp){msg.textContent='✗ URL';return}
  const s=document.getElementById('start').value,e=document.getElementById('end').value;
  const sISO=s?new Date(s+'T00:00:00Z').toISOString():null,eISO=e?new Date(e+'T23:59:59Z').toISOString():null;
  const btn=document.getElementById('extbtn');btn.disabled=true;msg.textContent=T.tpl_run;
  const talkOnly=document.getElementById('tplTalkOnly').checked;
  try{
-  let cont=null,raw=[],g=0;
-  do{const params={action:'query',list:'embeddedin',eititle:title,eilimit:'500',einamespace:talkOnly?'1':'0|1'};
-   if(cont)params.eicontinue=cont;const d=await mw(api,params);
-   raw.push(...(d.query?.embeddedin||[]));cont=d.continue?.eicontinue||null;g++;
-  }while(cont&&g<10);
-  const nsd=await mw(api,{action:'query',meta:'siteinfo',siprop:'namespaces'});
-  const talkPfx=(nsd.query?.namespaces?.['1']?.['*']||'Talk')+':';
-  const pageSet=new Set();
-  raw.forEach(x=>pageSet.add(x.ns===1?x.title.slice(talkPfx.length):x.title));
-  const pages=[...pageSet];
+  const pages=await templatePages(tp,talkOnly);
   const users=new Set();
   for(let i=0;i<pages.length;i++){
    pbar(bar,i,pages.length,pages[i]);
    const params={action:'query',prop:'revisions',titles:pages[i],rvprop:'user|timestamp',rvlimit:'500'};
    if(sISO)params.rvend=sISO;if(eISO)params.rvstart=eISO;
-   const d=await mw(api,params);
+   const d=await mw(tp.api,params);
    const page=Object.values(d.query?.pages||{})[0];
    (page?.revisions||[]).forEach(r=>{if(r.user&&!/bot$|бот$/i.test(r.user.trim())&&!isAnon(r.user.trim()))users.add(r.user)});
   }
@@ -437,28 +468,74 @@ async function runCheck(){
  const sISO=CONTEST.start?new Date(CONTEST.start+'T00:00:00Z').toISOString():null;
  const eISO=CONTEST.end?new Date(CONTEST.end+'T23:59:59Z').toISOString():null;
  const out={};
- for(let i=0;i<CONTEST.participants.length;i++){
-  const user=CONTEST.participants[i];pbar(bar,i,CONTEST.participants.length,user);
-  const row={perProject:{},bytes:0,edits:0,articles:0};const titles=new Set();
-  for(const pr of projects){
-   try{const cs=await fetchContribs(pr.api,user,sISO,eISO);let b=0;
-    const detail={};
-    cs.forEach(c=>{
-     if(c.sizediff>0)b+=c.sizediff;
-     titles.add(pr.host+'::'+c.title);
-     if(!detail[c.title])detail[c.title]={bytes:0,created:false};
-     if(c.sizediff>0)detail[c.title].bytes+=c.sizediff;
-     if('new' in c)detail[c.title].created=true;
-    });
-    const list=Object.entries(detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
-     .sort((a,b2)=>b2.bytes-a.bytes);
-    row.perProject[pr.host]={bytes:b,edits:cs.length,articles:new Set(cs.map(c=>c.title)).size,list};
-    row.bytes+=b;row.edits+=cs.length;
-   }catch(e){row.perProject[pr.host]={err:String(e.message||e)}}
-  }
-  row.articles=titles.size;out[user]=row;
+ CONTEST.participants.forEach(u=>out[u]={perProject:{},bytes:0,edits:0,articles:0,_titles:new Set()});
+
+ // якщо в конкурсі вказано шаблон — рахуємо внесок ЛИШЕ в межах статей,
+ // які дійсно позначені цим шаблоном (а не весь внесок учасника по вікі)
+ const tp=CONTEST.template?templateInfo(CONTEST.template):null;
+ let tplHost=null,tplPages=[];
+ if(tp){
+  try{tplPages=await templatePages(tp,!!CONTEST.tpl_talk_only);tplHost=tp.host}
+  catch(e){tplPages=[];tplHost=null}
  }
- pbar(bar,CONTEST.participants.length,CONTEST.participants.length,'');
+
+ const totalSteps=projects.reduce((s,pr)=>s+(pr.host===tplHost?tplPages.length:CONTEST.participants.length),0)||1;
+ let done=0;
+
+ for(const pr of projects){
+  if(pr.host===tplHost){
+   for(let i=0;i<tplPages.length;i++){
+    pbar(bar,done,totalSteps,tplPages[i]);done++;
+    try{
+     const revs=await pageRevisionsWithDiff(pr.api,tplPages[i]);
+     revs.forEach(r=>{
+      if(!r.timestamp)return;
+      if(sISO&&r.timestamp<sISO)return;
+      if(eISO&&r.timestamp>eISO)return;
+      if(!r.user||!out[r.user])return; // рахуємо тільки офіційних учасників конкурсу
+      const row=out[r.user];
+      if(!row.perProject[pr.host])row.perProject[pr.host]={bytes:0,edits:0,_titles:new Set(),_detail:{}};
+      const pp=row.perProject[pr.host];
+      if(r.diff>0){pp.bytes+=r.diff;row.bytes+=r.diff}
+      pp.edits++;row.edits++;
+      pp._titles.add(tplPages[i]);row._titles.add(pr.host+'::'+tplPages[i]);
+      if(!pp._detail[tplPages[i]])pp._detail[tplPages[i]]={bytes:0,created:false};
+      if(r.diff>0)pp._detail[tplPages[i]].bytes+=r.diff;
+      if('new' in r)pp._detail[tplPages[i]].created=true;
+     });
+    }catch(e){/* сторінку могли видалити/перейменувати — пропускаємо */}
+   }
+  }else{
+   for(let i=0;i<CONTEST.participants.length;i++){
+    const user=CONTEST.participants[i];pbar(bar,done,totalSteps,user);done++;
+    const row=out[user];
+    try{const cs=await fetchContribs(pr.api,user,sISO,eISO);let b=0;
+     const detail={};
+     cs.forEach(c=>{
+      if(c.sizediff>0)b+=c.sizediff;
+      row._titles.add(pr.host+'::'+c.title);
+      if(!detail[c.title])detail[c.title]={bytes:0,created:false};
+      if(c.sizediff>0)detail[c.title].bytes+=c.sizediff;
+      if('new' in c)detail[c.title].created=true;
+     });
+     const list=Object.entries(detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
+      .sort((a,b2)=>b2.bytes-a.bytes);
+     row.perProject[pr.host]={bytes:b,edits:cs.length,articles:new Set(cs.map(c=>c.title)).size,list};
+     row.bytes+=b;row.edits+=cs.length;
+    }catch(e){row.perProject[pr.host]={err:String(e.message||e)}}
+   }
+  }
+ }
+ Object.values(out).forEach(row=>{
+  const pp=row.perProject[tplHost];
+  if(pp&&pp._detail){
+   pp.list=Object.entries(pp._detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
+    .sort((a,b2)=>b2.bytes-a.bytes);
+   pp.articles=pp._titles.size;delete pp._detail;delete pp._titles;
+  }
+  row.articles=row._titles.size;delete row._titles;
+ });
+ pbar(bar,totalSteps,totalSteps,'');
  RESULTS=out;
  await fetch('/api/results/'+CID,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(out)});
  btn.disabled=false;btn.textContent=T.check;render();
@@ -597,7 +674,8 @@ ADMIN_TPL = """
      value="{{edit_contest.template if edit_contest else ''}}"
      placeholder="https://uk.wikivoyage.org/wiki/Шаблон:Cultural_Heritage_and_Notable_Personalities_2026">
     <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer">
-     <input type="checkbox" id="tplTalkOnly" style="width:auto"> {{t.tpl_talk_only}}
+     <input type="checkbox" id="tplTalkOnly" name="tpl_talk_only" style="width:auto"
+      {{'checked' if edit_contest and edit_contest.tpl_talk_only else ''}}> {{t.tpl_talk_only}}
     </label>
     <div style="margin-top:8px;display:flex;gap:10px;align-items:center">
      <button type="button" id="extbtn" class="btn-p" onclick="extractParticipants()">{{t.tpl_btn}}</button>
@@ -844,13 +922,14 @@ def contest_save():
     if not validate_formula(formula):
         formula = "bytes / 1000 + quality * 10"
     cid = f.get("id") or "c" + hex(int(time.time() * 1000))[2:]
-    db().execute("""INSERT INTO contests VALUES(?,?,?,?,?,?,?,?)
+    db().execute("""INSERT INTO contests VALUES(?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET name=excluded.name,template=excluded.template,
         projects=excluded.projects,participants=excluded.participants,
-        formula=excluded.formula,start=excluded.start,end=excluded.end""",
+        formula=excluded.formula,start=excluded.start,end=excluded.end,
+        tpl_talk_only=excluded.tpl_talk_only""",
         (cid, f.get("name", "").strip(), f.get("template", "").strip(),
          json.dumps(projects), json.dumps(participants), formula,
-         f.get("start", ""), f.get("end", "")))
+         f.get("start", ""), f.get("end", ""), 1 if f.get("tpl_talk_only") else 0))
     db().commit()
     return redirect(url_for("index", view="admin", contest=cid, msg=T[lang()]["saved"]))
 
