@@ -215,25 +215,48 @@ function templateTitleFromUrl(url) {
   }
 }
 
-// сторінки, що включають шаблон (учасницькі статті конкурсу)
+// назва простору назв обговорень для даного проєкту (кешується за api)
+const _talkNsCache = {};
+async function talkNamespaceName(api) {
+  if (_talkNsCache[api]) return _talkNsCache[api];
+  const p = new URLSearchParams({
+    action: "query", meta: "siteinfo", siprop: "namespaces",
+    format: "json", origin: "*",
+  });
+  const res = await fetch(api + "?" + p.toString());
+  const d = await res.json();
+  const name = d.query?.namespaces?.["1"]?.["*"] || "Talk";
+  _talkNsCache[api] = name;
+  return name;
+}
+
+// сторінки, що включають шаблон (учасницькі статті конкурсу).
+// Шаблон конкурсу нерідко розміщують на сторінці обговорення статті,
+// а не на самій статті — тому шукаємо в обох просторах назв (0 і 1),
+// а знайдені сторінки обговорення перетворюємо на відповідні статті.
 async function fetchTemplatePages(api, title) {
   let cont = null, guard = 0;
-  const pages = [];
+  const raw = [];
   do {
     const p = new URLSearchParams({
       action: "query", list: "embeddedin", eititle: title,
-      eilimit: "500", einamespace: "0", format: "json", origin: "*",
+      eilimit: "500", einamespace: "0|1", format: "json", origin: "*",
     });
     if (cont) p.set("eicontinue", cont);
     const res = await fetch(api + "?" + p.toString());
     if (!res.ok) throw new Error("HTTP " + res.status);
     const d = await res.json();
     if (d.error) throw new Error(d.error.info || "API error");
-    pages.push(...(d.query?.embeddedin || []).map((x) => x.title));
+    raw.push(...(d.query?.embeddedin || []));
     cont = d.continue?.eicontinue || null;
     guard++;
   } while (cont && guard < 10);
-  return pages;
+  const talkPrefix = (await talkNamespaceName(api)) + ":";
+  const pages = new Set();
+  for (const x of raw) {
+    pages.add(x.ns === 1 ? x.title.slice(talkPrefix.length) : x.title);
+  }
+  return [...pages];
 }
 
 // автори редагувань сторінки в межах періоду
