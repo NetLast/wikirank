@@ -26,6 +26,16 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(32)
+
+# ── OAuth через MediaWiki (Вікімедіа) — опційно, поряд зі звичайним логіном ──
+try:
+    import mwoauth
+except ImportError:
+    mwoauth = None
+OAUTH_MWURI = "https://meta.wikimedia.org/w/index.php"
+OAUTH_CONSUMER_KEY = os.environ.get("OAUTH_CONSUMER_KEY")
+OAUTH_CONSUMER_SECRET = os.environ.get("OAUTH_CONSUMER_SECRET")
+OAUTH_ENABLED = bool(mwoauth and OAUTH_CONSUMER_KEY and OAUTH_CONSUMER_SECRET)
 DB_PATH = os.environ.get("WIKIRANK_DB",
                          os.path.join(os.path.expanduser("~"), "wikirank.db"))
 
@@ -112,6 +122,8 @@ def validate_formula(expr):
 T = {
  "uk": dict(brand="ВікіРанг", tagline="Аналіз внеску учасників вікіпроєктів. Доступ лише для адмінів та журі.",
    login="Логін", password="Пароль", signin="Увійти", bad="Невірний логін або пароль",
+   or_="або", oauth_btn="Увійти через MediaWiki",
+   oauth_unknown="Ваш вікі-акаунт не зареєстровано в системі як журі чи адмін:",
    admin="адмін", jury="журі", logout="Вийти", nav_a="Оцінювання", nav_s="Налаштування",
    tab_c="Конкурси", tab_u="Журі та адміни", tab_p="Мій пароль",
    new_c="Новий конкурс", edit_c="Редагувати конкурс", c_name="Назва конкурсу",
@@ -144,6 +156,8 @@ T = {
    footer="Кількісний внесок = сума доданих байтів через API MediaWiki."),
  "en": dict(brand="WikiRank", tagline="Contribution analysis for wiki contests. Admins and jury only.",
    login="Login", password="Password", signin="Sign in", bad="Wrong login or password",
+   or_="or", oauth_btn="Log in with MediaWiki",
+   oauth_unknown="Your wiki account is not registered in the system as jury or admin:",
    admin="admin", jury="jury", logout="Log out", nav_a="Assessment", nav_s="Settings",
    tab_c="Contests", tab_u="Jury & admins", tab_p="My password",
    new_c="New contest", edit_c="Edit contest", c_name="Contest name",
@@ -174,6 +188,40 @@ T = {
    articles_btn="Articles", no_articles="No article edits within the contest scope.",
    created="created", expanded="expanded",
    footer="Quantitative contribution = sum of added bytes via the MediaWiki API."),
+ "pl": dict(brand="WikiRank", tagline="Analiza wkładu uczestników konkursów wiki. Dostęp tylko dla adminów i jury.",
+   login="Login", password="Hasło", signin="Zaloguj się", bad="Nieprawidłowy login lub hasło",
+   or_="lub", oauth_btn="Zaloguj się przez MediaWiki",
+   oauth_unknown="Twoje konto wiki nie jest zarejestrowane w systemie jako jury lub admin:",
+   admin="admin", jury="jury", logout="Wyloguj się", nav_a="Ocenianie", nav_s="Ustawienia",
+   tab_c="Konkursy", tab_u="Jury i admini", tab_p="Moje hasło",
+   new_c="Nowy konkurs", edit_c="Edytuj konkurs", c_name="Nazwa konkursu",
+   projects="Projekty — jeden link w wierszu",
+   projects_h="Dowolna wersja językowa MediaWiki: uk.wikivoyage.org, en.wikivoyage.org itd.",
+   d_start="Początek okresu (opcjonalnie)", d_end="Koniec okresu",
+   tpl="Szablon konkursu — identyfikuje artykuły kampanii",
+   tpl_btn="Wyodrębnij uczestników z szablonu", tpl_run="Wyodrębnianie…",
+   tpl_talk_only="Szablon umieszczony na stronie dyskusji (szukaj tylko tam, nie w artykułach)",
+   tpl_h="Znajdzie wszystkie artykuły z szablonem; autorzy edycji w podanym okresie zostaną dodani do listy (boty są pomijane).",
+   parts="Uczestnicy — jedna nazwa użytkownika w wierszu", formula="Formuła rankingowa dla jury",
+   formula_h="Zmienne: bytes (bajty), edits (edycje), articles (strony), quality (śr. ocena jury)",
+   save="Zapisz", create="Utwórz", cancel="Anuluj", edit="Edytuj", delete="Usuń",
+   no_c="Nie ma jeszcze żadnego konkursu.", parts_n="uczestników",
+   add_u="Dodaj konto", role="Rola", u_name="Imię (widoczne w komentarzach)",
+   accounts="Konta", its_you="to ty",
+   ch_pass="Zmiana hasła", new_pass="Nowe hasło", again="Powtórz",
+   mode="Tryb analizy", quant="Ilościowy", qual="Jakościowy",
+   qual_h="Analiza jakościowa automatycznie pokazuje też wkład ilościowy.",
+   modes_h="Tryby można włączać osobno lub razem.",
+   check="Sprawdź wkład", checking="Sprawdzanie…", export="Eksport CSV ↓",
+   th_u="Uczestnik", th_b="Dodane bajty", th_e="Edycje / strony", th_my="Moja ocena",
+   th_avg="Śr. jakość", th_score="Wynik wg formuły", scores_n="ocen",
+   comments="Komentarze", no_comments="Jeszcze brak komentarzy.",
+   comment_ph="Twój komentarz do wkładu uczestnika…", err="błąd",
+   no_parts="Jeszcze brak uczestników — admin może ich dodać w ustawieniach.",
+   f_of="Formuła konkursu:", saved="Zapisano ✓",
+   articles_btn="Artykuły", no_articles="Brak edycji artykułów w ramach konkursu.",
+   created="utworzono", expanded="rozbudowano",
+   footer="Wkład ilościowy = suma dodanych bajtów przez API MediaWiki."),
 }
 
 def lang():
@@ -248,7 +296,8 @@ LOGIN_HTML = """<!doctype html><html lang="{{l}}"><meta charset="utf-8">
   <div><div class="mono" style="font-size:12px;color:var(--gold);letter-spacing:.12em">WIKI·CONTEST</div>
   <h1 style="margin:4px 0">{{t.brand}}</h1></div>
   <div class="langsw"><a href="?lang=uk" class="{{'on' if l=='uk' else ''}}" style="color:var(--ink2)">УКР</a><a
-   href="?lang=en" class="{{'on' if l=='en' else ''}}" style="color:var(--ink2)">ENG</a></div>
+   href="?lang=en" class="{{'on' if l=='en' else ''}}" style="color:var(--ink2)">ENG</a><a
+   href="?lang=pl" class="{{'on' if l=='pl' else ''}}" style="color:var(--ink2)">PL</a></div>
  </div>
  <div class="hint" style="margin-bottom:12px">{{t.tagline}}</div>
  <form method="post">
@@ -257,6 +306,15 @@ LOGIN_HTML = """<!doctype html><html lang="{{l}}"><meta charset="utf-8">
   {% if err %}<div style="color:var(--err);margin-top:8px">{{t.bad}}</div>{% endif %}
   <button class="btn-p" style="width:100%;margin-top:14px">{{t.signin}}</button>
  </form>
+ {% if oauth_unknown %}
+ <div style="color:var(--err);margin-top:12px;font-size:13px">{{t.oauth_unknown}} «{{oauth_unknown}}»</div>
+ {% endif %}
+ {% if oauth_enabled %}
+ <div style="display:flex;align-items:center;gap:10px;margin:16px 0">
+  <div style="flex:1;height:1px;background:var(--line)"></div><span class="hint" style="font-size:11px">{{t.or_}}</span><div style="flex:1;height:1px;background:var(--line)"></div>
+ </div>
+ <a href="{{ url_for('login_oauth') }}" class="btn-s" style="display:block;text-align:center;text-decoration:none;box-sizing:border-box">{{t.oauth_btn}}</a>
+ {% endif %}
 </div></body></html>"""
 
 MAIN_HTML = """<!doctype html><html lang="{{l}}"><meta charset="utf-8">
@@ -278,7 +336,8 @@ MAIN_HTML = """<!doctype html><html lang="{{l}}"><meta charset="utf-8">
  </nav>
  <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
   <span class="langsw"><a href="?lang=uk&view={{view}}&contest={{cid or ''}}" class="{{'on' if l=='uk' else ''}}">УКР</a><a
-    href="?lang=en&view={{view}}&contest={{cid or ''}}" class="{{'on' if l=='en' else ''}}">ENG</a></span>
+    href="?lang=en&view={{view}}&contest={{cid or ''}}" class="{{'on' if l=='en' else ''}}">ENG</a><a
+    href="?lang=pl&view={{view}}&contest={{cid or ''}}" class="{{'on' if l=='pl' else ''}}">PL</a></span>
   <span class="chip {{'tag-a' if me.role=='admin' else 'tag-j'}}">{{t[me.role]}}</span>
   <b>{{me.name}}</b> <a href="{{url_for('logout')}}">{{t.logout}}</a>
  </div>
@@ -701,7 +760,42 @@ def login_view():
             session["user"] = {"login": row["login"], "name": row["name"], "role": row["role"]}
             return redirect(url_for("index"))
         err = True
-    return render_template_string(LOGIN_HTML, t=D(T[l]), l=l, err=err)
+    return render_template_string(LOGIN_HTML, t=D(T[l]), l=l, err=err, oauth_enabled=OAUTH_ENABLED)
+
+@app.route("/login/oauth")
+def login_oauth():
+    if not OAUTH_ENABLED:
+        return redirect(url_for("login_view"))
+    consumer_token = mwoauth.ConsumerToken(OAUTH_CONSUMER_KEY, OAUTH_CONSUMER_SECRET)
+    try:
+        redirect_url, request_token = mwoauth.initiate(OAUTH_MWURI, consumer_token)
+    except Exception:
+        app.logger.exception("mwoauth.initiate failed")
+        return redirect(url_for("login_view"))
+    session["oauth_request_token"] = dict(zip(request_token._fields, request_token))
+    return redirect(redirect_url)
+
+@app.route("/oauth-callback")
+def oauth_callback():
+    l = lang()
+    if not OAUTH_ENABLED or "oauth_request_token" not in session:
+        return redirect(url_for("login_view"))
+    consumer_token = mwoauth.ConsumerToken(OAUTH_CONSUMER_KEY, OAUTH_CONSUMER_SECRET)
+    request_token = mwoauth.RequestToken(**session.pop("oauth_request_token"))
+    try:
+        access_token = mwoauth.complete(
+            OAUTH_MWURI, consumer_token, request_token, request.query_string)
+        identity = mwoauth.identify(OAUTH_MWURI, consumer_token, access_token)
+    except Exception:
+        app.logger.exception("OAuth authentication failed")
+        return render_template_string(LOGIN_HTML, t=D(T[l]), l=l, err=True, oauth_enabled=OAUTH_ENABLED)
+    username = identity.get("username", "")
+    row = db().execute("SELECT * FROM users WHERE login=?", (username,)).fetchone()
+    if not row:
+        return render_template_string(LOGIN_HTML, t=D(T[l]), l=l, oauth_enabled=OAUTH_ENABLED,
+                                       oauth_unknown=username)
+    session["user"] = {"login": row["login"], "name": row["name"], "role": row["role"]}
+    return redirect(url_for("index"))
 
 @app.route("/logout")
 def logout():
