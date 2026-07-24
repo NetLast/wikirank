@@ -1,4 +1,0 @@
-flask>=3.0
-werkzeug>=3.0
-mwoauth>=0.4.0
- 
