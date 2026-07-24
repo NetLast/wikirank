@@ -18,6 +18,7 @@ import re
 import sqlite3
 import time
 from functools import wraps
+from urllib.parse import quote
 
 from flask import (Flask, g, jsonify, redirect, render_template_string,
                    request, session, url_for, Response)
@@ -131,6 +132,8 @@ T = {
    comment_ph="Ваш коментар до внеску учасника…", err="помилка",
    no_parts="Учасників ще немає — адмін може додати їх у налаштуваннях.",
    f_of="Формула конкурсу:", saved="Збережено ✓",
+   articles_btn="Статті", no_articles="У межах конкурсу немає редагувань статей.",
+   created="створено", expanded="доповнено",
    footer="Кількісний внесок = сума доданих байтів через API MediaWiki."),
  "en": dict(brand="WikiRank", tagline="Contribution analysis for wiki contests. Admins and jury only.",
    login="Login", password="Password", signin="Sign in", bad="Wrong login or password",
@@ -160,6 +163,8 @@ T = {
    comment_ph="Your comment on this participant's contribution…", err="error",
    no_parts="No participants yet — an admin can add them in settings.",
    f_of="Contest formula:", saved="Saved ✓",
+   articles_btn="Articles", no_articles="No article edits within the contest scope.",
+   created="created", expanded="expanded",
    footer="Quantitative contribution = sum of added bytes via the MediaWiki API."),
 }
 
@@ -282,6 +287,13 @@ function pbar(el,done,total,label){
  <div class="hint mono" style="font-size:11px">${done} / ${total} · ${pct}% ${label?'· '+esc(label):''}</div>`;
 }
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+// анонімний редактор: IPv4, IPv6 або замаскований тимчасовий обліковий запис (~2024-1…)
+function isAnon(u){
+ if(/^~/.test(u))return true;
+ if(/^\\d{1,3}(\\.\\d{1,3}){3}$/.test(u))return true;
+ if(/^[0-9a-f]{1,4}(::?[0-9a-f]{0,4}){2,7}$/i.test(u))return true;
+ return false;
+}
 async function mw(api,params){
  const p=new URLSearchParams({format:'json',origin:'*',...params});
  const r=await fetch(api+'?'+p);if(!r.ok)throw new Error('HTTP '+r.status);
@@ -289,7 +301,7 @@ async function mw(api,params){
 }
 async function fetchContribs(api,user,startISO,endISO){
  let cont=null,all=[],g=0;
- do{const params={action:'query',list:'usercontribs',ucuser:user,uclimit:'500',ucprop:'title|timestamp|sizediff'};
+ do{const params={action:'query',list:'usercontribs',ucuser:user,uclimit:'500',ucprop:'title|timestamp|sizediff|flags'};
   if(startISO)params.ucend=startISO;if(endISO)params.ucstart=endISO;
   if(cont)params.uccontinue=cont;
   const d=await mw(api,params);
@@ -326,7 +338,7 @@ async function extractParticipants(){
    if(sISO)params.rvend=sISO;if(eISO)params.rvstart=eISO;
    const d=await mw(api,params);
    const page=Object.values(d.query?.pages||{})[0];
-   (page?.revisions||[]).forEach(r=>{if(r.user&&!/bot$|бот$/i.test(r.user.trim()))users.add(r.user)});
+   (page?.revisions||[]).forEach(r=>{if(r.user&&!/bot$|бот$/i.test(r.user.trim())&&!isAnon(r.user.trim()))users.add(r.user)});
   }
   pbar(bar,pages.length,pages.length,'');
   const ta=document.getElementById('parts');
@@ -361,8 +373,17 @@ async function runCheck(){
   const row={perProject:{},bytes:0,edits:0,articles:0};const titles=new Set();
   for(const pr of projects){
    try{const cs=await fetchContribs(pr.api,user,sISO,eISO);let b=0;
-    cs.forEach(c=>{if(c.sizediff>0)b+=c.sizediff;titles.add(pr.host+'::'+c.title)});
-    row.perProject[pr.host]={bytes:b,edits:cs.length,articles:new Set(cs.map(c=>c.title)).size};
+    const detail={};
+    cs.forEach(c=>{
+     if(c.sizediff>0)b+=c.sizediff;
+     titles.add(pr.host+'::'+c.title);
+     if(!detail[c.title])detail[c.title]={bytes:0,created:false};
+     if(c.sizediff>0)detail[c.title].bytes+=c.sizediff;
+     if('new' in c)detail[c.title].created=true;
+    });
+    const list=Object.entries(detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
+     .sort((a,b2)=>b2.bytes-a.bytes);
+    row.perProject[pr.host]={bytes:b,edits:cs.length,articles:new Set(cs.map(c=>c.title)).size,list};
     row.bytes+=b;row.edits+=cs.length;
    }catch(e){row.perProject[pr.host]={err:String(e.message||e)}}
   }
@@ -386,6 +407,8 @@ async function saveComment(user){
  const r=await fetch('/api/state/'+CID);ASSESS=(await r.json()).assess;EXPANDED=user;render();
 }
 let EXPANDED=null;
+let ARTOPEN=null;
+function articleLink(origin,title){return origin+'/wiki/'+encodeURIComponent(title.replace(/ /g,'_'))}
 function evalFormula(f,v){
  const cleaned=f.replace(/\\b(bytes|edits|articles|quality)\\b/g,'1');
  if(!/^[\\d\\s+\\-*/().,]+$/.test(cleaned))return null;
@@ -428,7 +451,24 @@ function render(){
    h+='<td class="mono">'+(row.n?row.quality.toFixed(2):'—')+'<div class="hint">'+row.n+' '+T.scores_n+'</div></td>';
    h+='<td><span class="mono" style="font-weight:700;color:var(--gold);font-size:15px">'+(row.score!=null?row.score.toFixed(2):'—')+'</span></td>';
   }
-  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="EXPANDED=EXPANDED==='+JSON.stringify(row.user)+'?null:'+JSON.stringify(row.user)+';render()">'+T.comments+((row.a.comments||[]).length?' ('+row.a.comments.length+')':'')+'</button>':'')+'</td></tr>';
+  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="ARTOPEN=ARTOPEN==='+JSON.stringify(row.user)+'?null:'+JSON.stringify(row.user)+';render()">'+T.articles_btn+(row.r?' ('+row.r.articles+')':'')+'</button>':'')+
+      (QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="EXPANDED=EXPANDED==='+JSON.stringify(row.user)+'?null:'+JSON.stringify(row.user)+';render()">'+T.comments+((row.a.comments||[]).length?' ('+row.a.comments.length+')':'')+'</button>':'')+'</td></tr>';
+  if(QUAL&&ARTOPEN===row.user){
+   h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:640px">';
+   const items=[];
+   projects.forEach(p=>{const pp=row.r?row.r.perProject[p.host]:null;
+    (pp&&pp.list?pp.list:[]).forEach(it=>items.push({...it,origin:p.origin,label:p.label}))});
+   items.sort((a,b2)=>b2.bytes-a.bytes);
+   if(!items.length)h+='<div class="hint">'+T.no_articles+'</div>';
+   items.forEach(it=>{
+    h+='<div style="padding:6px 0;border-bottom:1px dashed var(--line);display:flex;align-items:center;gap:8px;flex-wrap:wrap">';
+    h+='<a class="wl" target="_blank" rel="noopener" href="'+articleLink(it.origin,it.title)+'">'+esc(it.title)+' ↗</a>';
+    h+='<span class="chip" style="background:'+(it.created?'#e6f4ea':'var(--acc-soft)')+';color:'+(it.created?'#1d7a4f':'var(--acc)')+'">'+(it.created?T.created:T.expanded)+'</span>';
+    h+='<span class="hint mono">'+it.label+' · +'+fmtN(it.bytes)+(LANG==='uk'?' Б':' B')+'</span>';
+    h+='</div>';
+   });
+   h+='</div></td></tr>';
+  }
   if(QUAL&&EXPANDED===row.user){
    h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:640px">';
    (row.a.comments||[]).forEach(c=>{h+='<div style="padding:6px 0;border-bottom:1px dashed var(--line)"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span><div>'+esc(c.text)+'</div></div>'});
@@ -787,7 +827,7 @@ def export_csv(cid):
                               else (x[1]["bytes"] if x[1] else -1)))
 
     buf = io.StringIO()
-    w = csv.writer(buf, delimiter=";")
+    w = csv.writer(buf, delimiter=",")
     head = ["#", t["th_u"]]
     if quant:
         head += [t["th_b"]] + hosts + [t["th_e"]]
@@ -808,9 +848,14 @@ def export_csv(cid):
                      " | ".join(f"{c['jury']} ({c['date']}): {c['text']}" for c in a["comments"])]
         w.writerow(line)
     safe = re.sub(r"[^\w \-]", "", contest["name"], flags=re.U).strip().replace(" ", "_") or "contest"
+    ascii_fallback = re.sub(r"[^A-Za-z0-9_\-]", "", safe)
+    if not re.search(r"[A-Za-z0-9]", ascii_fallback):
+        ascii_fallback = "contest"
+    utf8_name = quote(safe + ".csv")
     return Response("\ufeff" + buf.getvalue(),
                     mimetype="text/csv; charset=utf-8",
-                    headers={"Content-Disposition": f"attachment; filename={safe}.csv"})
+                    headers={"Content-Disposition":
+                             f"attachment; filename=\"{ascii_fallback}.csv\"; filename*=UTF-8''{utf8_name}"})
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
