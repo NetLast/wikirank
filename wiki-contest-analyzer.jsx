@@ -708,7 +708,6 @@ function Analysis({ contest, me, t, lang }) {
   const [runDone, setRunDone] = useState(0);
   const [runLabel, setRunLabel] = useState("");
   const [drafts, setDrafts] = useState({});
-  const [expanded, setExpanded] = useState(null);
   const [artOpen, setArtOpen] = useState(null);
 
   const projects = useMemo(() => contest.projects.map(projectInfo).filter(Boolean), [contest]);
@@ -717,7 +716,7 @@ function Analysis({ contest, me, t, lang }) {
     (async () => {
       setAssess(await sGet(kAssess(contest.id), {}));
       setResults(await sGet(kResults(contest.id), null));
-      setExpanded(null); setDrafts({});
+      setArtOpen(null); setDrafts({});
     })();
   }, [contest.id]);
 
@@ -773,32 +772,58 @@ function Analysis({ contest, me, t, lang }) {
     setRunning(false);
   };
 
-  const saveScore = async (user, val) => {
+  const saveScore = async (user, article, val) => {
     const num = val === "" ? null : Number(val);
-    const next = { ...assess, [user]: { ...(assess[user] || {}), scores: { ...((assess[user] || {}).scores || {}), [me.login]: num } } };
+    const userAssess = assess[user] || {};
+    const artAssess = userAssess[article] || { scores: {}, comments: [] };
+    const next = {
+      ...assess,
+      [user]: { ...userAssess, [article]: { ...artAssess, scores: { ...artAssess.scores, [me.login]: num } } },
+    };
     setAssess(next);
     await sSet(kAssess(contest.id), next);
   };
-  const saveComment = async (user) => {
-    const text = (drafts[user] || "").trim();
+  const draftKey = (user, article) => user + "||" + article;
+  const saveComment = async (user, article) => {
+    const key = draftKey(user, article);
+    const text = (drafts[key] || "").trim();
     if (!text) return;
     const entry = { jury: me.name, text, date: new Date().toISOString().slice(0, 16).replace("T", " ") };
-    const next = { ...assess, [user]: { ...(assess[user] || {}), comments: [...(((assess[user] || {}).comments) || []), entry] } };
+    const userAssess = assess[user] || {};
+    const artAssess = userAssess[article] || { scores: {}, comments: [] };
+    const next = {
+      ...assess,
+      [user]: { ...userAssess, [article]: { ...artAssess, comments: [...(artAssess.comments || []), entry] } },
+    };
     setAssess(next);
     await sSet(kAssess(contest.id), next);
-    setDrafts({ ...drafts, [user]: "" });
+    setDrafts({ ...drafts, [key]: "" });
+  };
+
+  // якість учасника = середнє арифметичне середніх оцінок по кожній статті
+  const articleQuality = (participantAssess) => {
+    if (!participantAssess) return { quality: 0, n: 0 };
+    const avgs = [];
+    let n = 0;
+    Object.values(participantAssess).forEach((a) => {
+      const vals = Object.values(a.scores || {}).filter((v) => v != null);
+      if (vals.length) {
+        avgs.push(vals.reduce((x, y) => x + y, 0) / vals.length);
+        n += vals.length;
+      }
+    });
+    return { quality: avgs.length ? avgs.reduce((x, y) => x + y, 0) / avgs.length : 0, n };
   };
 
   const rows = useMemo(() => {
     return contest.participants.map((user) => {
       const r = results?.[user];
-      const a = assess[user] || {};
-      const scores = Object.values(a.scores || {}).filter((v) => v != null);
-      const quality = scores.length ? scores.reduce((x, y) => x + y, 0) / scores.length : 0;
+      const pa = assess[user] || {};
+      const { quality, n } = articleQuality(pa);
       const score = r
         ? evalFormula(contest.formula, { bytes: r.bytes, edits: r.edits, articles: r.articles, quality })
         : null;
-      return { user, r, a, quality, nScores: scores.length, score, myScore: (a.scores || {})[me.login] };
+      return { user, r, pa, quality, nScores: n, score };
     }).sort((x, y) => (qual ? (y.score ?? -1e18) - (x.score ?? -1e18) : (y.r?.bytes ?? -1) - (x.r?.bytes ?? -1)));
   }, [contest, results, assess, qual, me.login]);
 
@@ -824,17 +849,21 @@ function Analysis({ contest, me, t, lang }) {
         line.push(row.r?.edits ?? "", row.r?.articles ?? "");
       }
       if (qual) {
+        const allComments = [];
+        Object.entries(row.pa || {}).forEach(([art, ad]) => {
+          (ad.comments || []).forEach((c) => allComments.push(`[${art}] ${c.jury} (${c.date}): ${c.text}`));
+        });
         line.push(
           row.nScores ? row.quality.toFixed(2) : "",
           row.nScores,
           row.score != null ? row.score.toFixed(2) : "",
-          (row.a.comments || []).map((c) => `${c.jury} (${c.date}): ${c.text}`).join(" | ")
+          allComments.join(" | ")
         );
       }
       lines.push(line);
     });
     const csv = lines
-      .map((r) => r.map((c) => `"${String(c ?? "").replace(/"/g, '""')}"`).join(";"))
+      .map((r) => r.map((c) => `"${String(c ?? "").replace(/"/g, '""')}"`).join(","))
       .join("\r\n");
     const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
     const a = document.createElement("a");
@@ -883,7 +912,6 @@ function Analysis({ contest, me, t, lang }) {
               {quant && <th>{t.thBytes}</th>}
               {quant && projects.map((p) => <th key={p.host}>{p.label}</th>)}
               {quant && <th>{t.thEdits}</th>}
-              {qual && <th>{t.thMy}</th>}
               {qual && <th>{t.thAvg}</th>}
               {qual && <th>{t.thScore}</th>}
               <th></th>
@@ -932,12 +960,6 @@ function Analysis({ contest, me, t, lang }) {
                     </td>
                   )}
                   {qual && (
-                    <td>
-                      <input type="number" step="0.1" style={{ width: 74 }} value={row.myScore ?? ""}
-                        onChange={(e) => saveScore(row.user, e.target.value)} aria-label={t.scoreFor + row.user} />
-                    </td>
-                  )}
-                  {qual && (
                     <td className="mono">
                       {row.nScores ? row.quality.toFixed(2) : "—"}
                       <div className="hint">{row.nScores} {t.scores}</div>
@@ -952,15 +974,9 @@ function Analysis({ contest, me, t, lang }) {
                   )}
                   <td>
                     {qual && (
-                      <button className="btn-s" style={{ padding: "4px 10px", fontSize: 12, marginRight: 6 }}
+                      <button className="btn-s" style={{ padding: "4px 10px", fontSize: 12 }}
                         onClick={() => setArtOpen(artOpen === row.user ? null : row.user)}>
                         {t.articlesBtn}{row.r ? ` (${row.r.articles})` : ""}
-                      </button>
-                    )}
-                    {qual && (
-                      <button className="btn-s" style={{ padding: "4px 10px", fontSize: 12 }}
-                        onClick={() => setExpanded(expanded === row.user ? null : row.user)}>
-                        {t.comments}{row.a.comments?.length ? ` (${row.a.comments.length})` : ""}
                       </button>
                     )}
                   </td>
@@ -975,43 +991,54 @@ function Analysis({ contest, me, t, lang }) {
                   return (
                     <tr>
                       <td colSpan={99} style={{ background: "#fafbfc" }}>
-                        <div style={{ maxWidth: 640 }}>
+                        <div style={{ maxWidth: 760 }}>
                           {!items.length && <div className="hint">{t.noArticles}</div>}
-                          {items.map((it, j) => (
-                            <div key={j} style={{ padding: "6px 0", borderBottom: "1px dashed var(--line)", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                              <a className="wl" target="_blank" rel="noopener noreferrer" href={articleLink(it.origin, it.title)}>{it.title} ↗</a>
-                              <span className="chip" style={{ background: it.created ? "#e6f4ea" : "var(--acc-soft)", color: it.created ? "#1d7a4f" : "var(--acc)" }}>
-                                {it.created ? t.created : t.expanded}
-                              </span>
-                              <span className="hint mono">{it.label} · +{fmt(it.bytes, lang)}{lang === "uk" ? " Б" : " B"}</span>
-                            </div>
-                          ))}
+                          {items.map((it, j) => {
+                            const ad = (row.pa && row.pa[it.title]) || { scores: {}, comments: [] };
+                            const vals = Object.values(ad.scores || {}).filter((v) => v != null);
+                            const avg = vals.length ? vals.reduce((x, y) => x + y, 0) / vals.length : null;
+                            const my = (ad.scores || {})[me.login];
+                            const dKey = draftKey(row.user, it.title);
+                            return (
+                              <div key={j} style={{ padding: "10px 0", borderBottom: "1px dashed var(--line)" }}>
+                                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                                  <a className="wl" target="_blank" rel="noopener noreferrer" href={articleLink(it.origin, it.title)}>{it.title} ↗</a>
+                                  <span className="chip" style={{ background: it.created ? "#e6f4ea" : "var(--acc-soft)", color: it.created ? "#1d7a4f" : "var(--acc)" }}>
+                                    {it.created ? t.created : t.expanded}
+                                  </span>
+                                  <span className="hint mono">{it.label} · +{fmt(it.bytes, lang)}{lang === "uk" ? " Б" : " B"}</span>
+                                </div>
+                                <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, flexWrap: "wrap" }}>
+                                  <label className="hint" style={{ fontSize: 12 }}>{t.thMy}:</label>
+                                  <input type="number" step="0.1" style={{ width: 70 }} value={my ?? ""}
+                                    onChange={(e) => saveScore(row.user, it.title, e.target.value)}
+                                    aria-label={t.scoreFor + row.user + " — " + it.title} />
+                                  <span className="hint mono">{t.thAvg}: {avg != null ? avg.toFixed(2) : "—"}{vals.length ? ` (${vals.length} ${t.scores})` : ""}</span>
+                                </div>
+                                <div style={{ marginTop: 6 }}>
+                                  {(ad.comments || []).map((c, k) => (
+                                    <div key={k} style={{ padding: "4px 0" }}>
+                                      <b>{c.jury}</b> <span className="hint mono">{c.date}</span>
+                                      <div>{c.text}</div>
+                                    </div>
+                                  ))}
+                                  {!ad.comments?.length && <div className="hint" style={{ fontSize: 12 }}>{t.noComments}</div>}
+                                  <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                                    <input placeholder={t.commentPh} value={drafts[dKey] || ""}
+                                      onChange={(e) => setDrafts({ ...drafts, [dKey]: e.target.value })}
+                                      onKeyDown={(e) => e.key === "Enter" && saveComment(row.user, it.title)} />
+                                    <button className="btn-p" style={{ padding: "4px 10px", fontSize: 12 }}
+                                      onClick={() => saveComment(row.user, it.title)}>{t.save}</button>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
                       </td>
                     </tr>
                   );
                 })()}
-                {qual && expanded === row.user && (
-                  <tr>
-                    <td colSpan={99} style={{ background: "#fafbfc" }}>
-                      <div style={{ maxWidth: 640 }}>
-                        {(row.a.comments || []).map((c, j) => (
-                          <div key={j} style={{ padding: "6px 0", borderBottom: "1px dashed var(--line)" }}>
-                            <b>{c.jury}</b> <span className="hint mono">{c.date}</span>
-                            <div>{c.text}</div>
-                          </div>
-                        ))}
-                        {!row.a.comments?.length && <div className="hint">{t.noComments}</div>}
-                        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                          <input placeholder={t.commentPh} value={drafts[row.user] || ""}
-                            onChange={(e) => setDrafts({ ...drafts, [row.user]: e.target.value })}
-                            onKeyDown={(e) => e.key === "Enter" && saveComment(row.user)} />
-                          <button className="btn-p" onClick={() => saveComment(row.user)}>{t.save}</button>
-                        </div>
-                      </div>
-                    </td>
-                  </tr>
-                )}
               </React.Fragment>
             ))}
             {!rows.length && (
