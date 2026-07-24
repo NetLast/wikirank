@@ -308,7 +308,7 @@ async function extractParticipants(){
  const s=document.getElementById('start').value,e=document.getElementById('end').value;
  const sISO=s?new Date(s+'T00:00:00Z').toISOString():null,eISO=e?new Date(e+'T23:59:59Z').toISOString():null;
  const btn=document.getElementById('extbtn');btn.disabled=true;msg.textContent=T.tpl_run;
-  try{
+ try{
   let cont=null,raw=[],g=0;
   do{const params={action:'query',list:'embeddedin',eititle:title,eilimit:'500',einamespace:'0|1'};
    if(cont)params.eicontinue=cont;const d=await mw(api,params);
