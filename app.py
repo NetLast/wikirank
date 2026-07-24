@@ -120,6 +120,7 @@ T = {
    d_start="Початок періоду (необов'язково)", d_end="Кінець періоду",
    tpl="Шаблон конкурсу — ідентифікує статті кампанії",
    tpl_btn="Витягнути учасників із шаблону", tpl_run="Витягую…",
+   tpl_talk_only="Шаблон розміщено на сторінці обговорення (шукати лише там, а не в статтях)",
    tpl_h="Знайдуться всі статті з шаблоном; автори редагувань у межах дат додадуться до списку (боти відсіюються).",
    parts="Учасники — по одному імені в рядку", formula="Формула ранжування для журі",
    formula_h="Змінні: bytes (байти), edits (редагування), articles (сторінки), quality (сер. оцінка журі)",
@@ -151,6 +152,7 @@ T = {
    d_start="Period start (optional)", d_end="Period end",
    tpl="Contest template — identifies campaign articles",
    tpl_btn="Extract participants from template", tpl_run="Extracting…",
+   tpl_talk_only="Template is placed on talk pages (search only there, not in articles)",
    tpl_h="Finds every article transcluding the template; revision authors within the dates are merged into the list (bots filtered out).",
    parts="Participants — one username per line", formula="Ranking formula for the jury",
    formula_h="Variables: bytes, edits, articles, quality (avg jury score)",
@@ -326,9 +328,10 @@ async function extractParticipants(){
  const s=document.getElementById('start').value,e=document.getElementById('end').value;
  const sISO=s?new Date(s+'T00:00:00Z').toISOString():null,eISO=e?new Date(e+'T23:59:59Z').toISOString():null;
  const btn=document.getElementById('extbtn');btn.disabled=true;msg.textContent=T.tpl_run;
+ const talkOnly=document.getElementById('tplTalkOnly').checked;
  try{
   let cont=null,raw=[],g=0;
-  do{const params={action:'query',list:'embeddedin',eititle:title,eilimit:'500',einamespace:'0|1'};
+  do{const params={action:'query',list:'embeddedin',eititle:title,eilimit:'500',einamespace:talkOnly?'1':'0|1'};
    if(cont)params.eicontinue=cont;const d=await mw(api,params);
    raw.push(...(d.query?.embeddedin||[]));cont=d.continue?.eicontinue||null;g++;
   }while(cont&&g<10);
@@ -534,6 +537,9 @@ ADMIN_TPL = """
     <input id="tpl" name="template" class="mono" style="font-size:12px"
      value="{{edit_contest.template if edit_contest else ''}}"
      placeholder="https://uk.wikivoyage.org/wiki/Шаблон:Cultural_Heritage_and_Notable_Personalities_2026">
+    <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer">
+     <input type="checkbox" id="tplTalkOnly" style="width:auto"> {{t.tpl_talk_only}}
+    </label>
     <div style="margin-top:8px;display:flex;gap:10px;align-items:center">
      <button type="button" id="extbtn" class="btn-p" onclick="extractParticipants()">{{t.tpl_btn}}</button>
      <span id="extmsg" class="hint mono"></span>
