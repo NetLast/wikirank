@@ -139,6 +139,69 @@ const T = {
     csvEdits: "Edits", csvArticles: "Pages", csvAvg: "Avg quality", csvCnt: "Scores count",
     csvScore: "Formula score", csvComments: "Comments",
   },
+  pl: {
+    brand: "WikiRank",
+    tagline: "Analiza wkładu uczestników konkursów wiki. Dostęp tylko dla adminów i jury.",
+    login: "Login", password: "Hasło", signin: "Zaloguj się",
+    badCreds: "Nieprawidłowy login lub hasło",
+    firstRun: "Pierwsze uruchomienie: utworzono konto admina {c}. Zmień hasło w ustawieniach.",
+    admin: "admin", jury: "jury", youAre: "to ty", logout: "Wyloguj się",
+    navAnalysis: "Ocenianie", navSettings: "Ustawienia",
+    tabContests: "Konkursy", tabUsers: "Jury i admini", tabPassword: "Moje hasło",
+    newContest: "Nowy konkurs", editContest: "Edytuj konkurs",
+    contestName: "Nazwa konkursu",
+    projectsLabel: "Projekty — jeden link w wierszu",
+    projectsHint: "Dowolna wersja językowa MediaWiki: uk.wikivoyage.org, en.wikivoyage.org, en.wikiquote.org itd. — po prostu wklej link.",
+    dateStart: "Początek okresu (opcjonalnie)", dateEnd: "Koniec okresu",
+    tplLabel: "Szablon konkursu — identyfikuje artykuły kampanii",
+    tplExtract: "Wyodrębnij uczestników z szablonu", tplExtracting: "Wyodrębnianie…",
+    tplTalkOnly: "Szablon umieszczony na stronie dyskusji (szukaj tylko tam, nie w artykułach)",
+    tplHint: "Narzędzie znajdzie wszystkie artykuły zawierające szablon i zbierze autorów edycji w podanym okresie (boty są pomijane). Znalezione nazwy dodawane są do listy poniżej — można ją edytować ręcznie.",
+    tplBad: "Wklej poprawny link do szablonu konkursu",
+    tplNone: "Żaden artykuł nie zawiera tego szablonu",
+    tplSearch: "Szukam stron z szablonem…",
+    tplPage: "Strona", tplDone: "Znaleziono artykułów: {p}, uczestników: {u} ✓",
+    tplErr: "Błąd wyodrębniania: ",
+    participantsLabel: "Uczestnicy kampanii — jedna nazwa użytkownika w wierszu",
+    participantsPh: "Nazwa użytkownika 1\nNazwa użytkownika 2\n(lub użyj wyodrębniania z szablonu powyżej)",
+    formulaLabel: "Formuła rankingowa dla jury",
+    formulaHint: "Zmienne:", vBytes: "dodane bajty", vEdits: "edycje", vArticles: "strony", vQuality: "średnia ocena jury",
+    saveChanges: "Zapisz zmiany", createContest: "Utwórz konkurs", cancel: "Anuluj",
+    contests: "Konkursy", noContests: "Nie ma jeszcze żadnego konkursu — utwórz pierwszy po lewej.",
+    participantsN: "uczestników", tpl: "szablon", edit: "Edytuj", del: "Usuń",
+    saved: "Zapisano ✓",
+    errName: "Podaj nazwę konkursu", errProjects: "Dodaj co najmniej jeden link do projektu", errUrl: "Nieprawidłowy link: ",
+    fEmpty: "Formuła jest pusta",
+    fChars: "Dozwolone są tylko liczby, nawiasy, + − * / oraz zmienne: ",
+    fNaN: "Formuła nie zwraca liczby", fSyntax: "Błąd składni w formule",
+    addUser: "Dodaj konto", role: "Rola",
+    nameVisible: "Imię (widoczne w komentarzach)",
+    userCreated: "Konto utworzono ✓",
+    errUserReq: "Login i hasło są wymagane", errUserDup: "Taki login już istnieje",
+    accounts: "Konta", create: "Utwórz",
+    chPass: "Zmiana hasła", newPass: "Nowe hasło", again: "Powtórz",
+    passShort: "Hasło za krótkie (minimum 4 znaki)", passDiff: "Hasła się nie zgadzają", passOk: "Hasło zmienione ✓", save: "Zapisz",
+    mode: "Tryb analizy", mQuant: "Ilościowy", mQual: "Jakościowy",
+    qualAuto: "Analiza jakościowa automatycznie pokazuje też wkład ilościowy.",
+    modesHint: "Tryby można włączać osobno lub razem.",
+    check: "Sprawdź wkład", checking: "Sprawdzanie…", exportCsv: "Eksport CSV ↓",
+    thUser: "Uczestnik", thBytes: "Dodane bajty", thEdits: "Edycje / strony",
+    thMy: "Moja ocena", thAvg: "Śr. jakość", thScore: "Wynik wg formuły",
+    scores: "ocen", comments: "Komentarze", noComments: "Jeszcze brak komentarzy.",
+    articlesBtn: "Artykuły", noArticles: "Brak edycji artykułów w ramach konkursu.",
+    created: "utworzono", expanded: "rozbudowano",
+    commentPh: "Twój komentarz do wkładu uczestnika…",
+    error: "błąd",
+    noParticipants: "W tym konkursie nie ma jeszcze uczestników — admin może ich dodać w ustawieniach.",
+    formulaOf: "Formuła konkursu:", formulaNote: "wynik jest przeliczany automatycznie po sprawdzeniu wkładu i wystawieniu ocen przez jury.",
+    noContest: "Nie ma żadnego konkursu.", createIn: "Utwórz go w „Ustawieniach”.", askAdmin: "Skontaktuj się z administratorem.",
+    footer: "Dane konkursów, oceny i komentarze są przechowywane we wspólnym magazynie i widoczne dla wszystkich użytkowników tego narzędzia. Wkład ilościowy jest liczony przez API MediaWiki jako suma dodanych bajtów (dodatnie zmiany rozmiaru).",
+    loading: "Ładowanie…",
+    scoreFor: "Ocena dla ",
+    csvN: "#", csvUser: "Uczestnik", csvBytesTotal: "Dodane bajty (razem)", csvBytes: "Bajty: ",
+    csvEdits: "Edycje", csvArticles: "Strony", csvAvg: "Średnia jakość", csvCnt: "Liczba ocen",
+    csvScore: "Wynik wg formuły", csvComments: "Komentarze",
+  },
 };
 
 // анонімний редактор: IPv4, IPv6 або замаскований тимчасовий обліковий запис (~2024-1…)
@@ -315,7 +378,7 @@ function evalFormula(f, vars) {
   }
 }
 
-const fmt = (n, lang) => (n == null ? "—" : n.toLocaleString(lang === "uk" ? "uk-UA" : "en-GB"));
+const fmt = (n, lang) => (n == null ? "—" : n.toLocaleString(lang === "uk" ? "uk-UA" : lang === "pl" ? "pl-PL" : "en-GB"));
 
 // ── Стилі ────────────────────────────────────────────────────
 const css = `
@@ -389,6 +452,7 @@ function LangSwitch({ lang, setLang, light }) {
     <div className={"langsw" + (light ? " light" : "")} role="group" aria-label="Language">
       <button className={lang === "uk" ? "on" : ""} onClick={() => setLang("uk")}>УКР</button>
       <button className={lang === "en" ? "on" : ""} onClick={() => setLang("en")}>ENG</button>
+      <button className={lang === "pl" ? "on" : ""} onClick={() => setLang("pl")}>PL</button>
     </div>
   );
 }
