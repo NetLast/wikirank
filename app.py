@@ -308,12 +308,17 @@ async function extractParticipants(){
  const s=document.getElementById('start').value,e=document.getElementById('end').value;
  const sISO=s?new Date(s+'T00:00:00Z').toISOString():null,eISO=e?new Date(e+'T23:59:59Z').toISOString():null;
  const btn=document.getElementById('extbtn');btn.disabled=true;msg.textContent=T.tpl_run;
- try{
-  let cont=null,pages=[],g=0;
-  do{const params={action:'query',list:'embeddedin',eititle:title,eilimit:'500',einamespace:'0'};
+  try{
+  let cont=null,raw=[],g=0;
+  do{const params={action:'query',list:'embeddedin',eititle:title,eilimit:'500',einamespace:'0|1'};
    if(cont)params.eicontinue=cont;const d=await mw(api,params);
-   pages.push(...(d.query?.embeddedin||[]).map(x=>x.title));cont=d.continue?.eicontinue||null;g++;
+   raw.push(...(d.query?.embeddedin||[]));cont=d.continue?.eicontinue||null;g++;
   }while(cont&&g<10);
+  const nsd=await mw(api,{action:'query',meta:'siteinfo',siprop:'namespaces'});
+  const talkPfx=(nsd.query?.namespaces?.['1']?.['*']||'Talk')+':';
+  const pageSet=new Set();
+  raw.forEach(x=>pageSet.add(x.ns===1?x.title.slice(talkPfx.length):x.title));
+  const pages=[...pageSet];
   const users=new Set();
   for(let i=0;i<pages.length;i++){
    pbar(bar,i,pages.length,pages[i]);
