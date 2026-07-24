@@ -57,6 +57,12 @@ CREATE TABLE IF NOT EXISTS scores(
 CREATE TABLE IF NOT EXISTS comments(
   id INTEGER PRIMARY KEY AUTOINCREMENT, contest_id TEXT, participant TEXT,
   jury_name TEXT, text TEXT, date TEXT);
+CREATE TABLE IF NOT EXISTS article_scores(
+  contest_id TEXT, participant TEXT, article TEXT, jury TEXT, value REAL,
+  PRIMARY KEY(contest_id, participant, article, jury));
+CREATE TABLE IF NOT EXISTS article_comments(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, contest_id TEXT, participant TEXT, article TEXT,
+  jury_name TEXT, text TEXT, date TEXT);
 """
 
 def init_db():
@@ -353,6 +359,7 @@ async function extractParticipants(){
 <script>
 const CONTEST={{cjson|safe}};
 let RESULTS={{rjson|safe}}, ASSESS={{ajson|safe}};
+const JURY_LOGIN={{me.login|tojson}};
 let QUANT=true,QUAL=false;
 const projects=(CONTEST?CONTEST.projects:[]).map(p=>{try{const u=new URL(p);
  return{origin:u.origin,api:u.origin+'/w/api.php',label:u.hostname.replace('.org',''),host:u.hostname}}catch(e){return null}}).filter(Boolean);
@@ -394,21 +401,29 @@ async function runCheck(){
  await fetch('/api/results/'+CID,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(out)});
  btn.disabled=false;btn.textContent=T.check;render();
 }
-async function saveScore(user,val){
+async function saveScore(user,article,val){
  await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({contest:CID,participant:user,value:val===''?null:Number(val)})});
+  body:JSON.stringify({contest:CID,participant:user,article,value:val===''?null:Number(val)})});
  const r=await fetch('/api/state/'+CID);ASSESS=(await r.json()).assess;render();
 }
-async function saveComment(user){
- const inp=document.getElementById('cm_'+btoa(unescape(encodeURIComponent(user))).replace(/[^a-z0-9]/gi,''));
+async function saveComment(user,article){
+ const inp=document.getElementById('cm_'+idFor(user+'||'+article));
  const text=inp.value.trim();if(!text)return;
  await fetch('/api/comment',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({contest:CID,participant:user,text})});
- const r=await fetch('/api/state/'+CID);ASSESS=(await r.json()).assess;EXPANDED=user;render();
+  body:JSON.stringify({contest:CID,participant:user,article,text})});
+ const r=await fetch('/api/state/'+CID);ASSESS=(await r.json()).assess;render();
 }
-let EXPANDED=null;
 let ARTOPEN=null;
 function articleLink(origin,title){return origin+'/wiki/'+encodeURIComponent(title.replace(/ /g,'_'))}
+function articleQuality(pa){
+ if(!pa)return{quality:0,n:0};
+ const avgs=[];let n=0;
+ Object.values(pa).forEach(a=>{
+  const vals=Object.values(a.scores||{}).filter(v=>v!=null);
+  if(vals.length){avgs.push(vals.reduce((x,y)=>x+y,0)/vals.length);n+=vals.length}
+ });
+ return{quality:avgs.length?avgs.reduce((x,y)=>x+y,0)/avgs.length:0,n};
+}
 function evalFormula(f,v){
  const cleaned=f.replace(/\\b(bytes|edits|articles|quality)\\b/g,'1');
  if(!/^[\\d\\s+\\-*/().,]+$/.test(cleaned))return null;
@@ -423,16 +438,15 @@ function contribLink(origin,user){return origin+'/wiki/Special:Contributions/'+e
 function render(){
  const el=document.getElementById('tbl');if(!CONTEST){el.innerHTML='';return}
  const rows=CONTEST.participants.map(user=>{
-  const r=RESULTS?RESULTS[user]:null;const a=ASSESS[user]||{scores:{},comments:[]};
-  const vals=Object.values(a.scores||{}).filter(v=>v!=null);
-  const quality=vals.length?vals.reduce((x,y)=>x+y,0)/vals.length:0;
+  const r=RESULTS?RESULTS[user]:null;const pa=ASSESS[user]||{};
+  const{quality,n}=articleQuality(pa);
   const score=r?evalFormula(CONTEST.formula,{bytes:r.bytes,edits:r.edits,articles:r.articles,quality}):null;
-  return{user,r,a,quality,n:vals.length,score,my:(a.scores||{})[{{me.login|tojson}}]};
+  return{user,r,pa,quality,n,score};
  }).sort((x,y)=>QUAL?((y.score??-1e18)-(x.score??-1e18)):((y.r?y.r.bytes:-1)-(x.r?x.r.bytes:-1)));
  const maxB=Math.max(1,...rows.map(r=>r.r?r.r.bytes:0));
  let h='<table><thead><tr><th>#</th><th>'+T.th_u+'</th>';
  if(QUANT){h+='<th>'+T.th_b+'</th>';projects.forEach(p=>h+='<th>'+esc(p.label)+'</th>');h+='<th>'+T.th_e+'</th>'}
- if(QUAL)h+='<th>'+T.th_my+'</th><th>'+T.th_avg+'</th><th>'+T.th_score+'</th>';
+ if(QUAL)h+='<th>'+T.th_avg+'</th><th>'+T.th_score+'</th>';
  h+='<th></th></tr></thead><tbody>';
  if(!rows.length)h+='<tr><td colspan="99" class="hint" style="padding:20px">'+T.no_parts+'</td></tr>';
  rows.forEach((row,i)=>{
@@ -447,33 +461,41 @@ function render(){
    h+='<td class="mono" style="font-size:12px">'+(row.r?fmtN(row.r.edits)+' / '+fmtN(row.r.articles):'—')+'</td>';
   }
   if(QUAL){
-   h+='<td><input type="number" step="0.1" style="width:74px" value="'+(row.my??'')+'" onchange="saveScore('+esc(JSON.stringify(row.user))+',this.value)"></td>';
    h+='<td class="mono">'+(row.n?row.quality.toFixed(2):'—')+'<div class="hint">'+row.n+' '+T.scores_n+'</div></td>';
    h+='<td><span class="mono" style="font-weight:700;color:var(--gold);font-size:15px">'+(row.score!=null?row.score.toFixed(2):'—')+'</span></td>';
   }
-  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px;margin-right:6px" onclick="ARTOPEN=ARTOPEN==='+esc(JSON.stringify(row.user))+'?null:'+esc(JSON.stringify(row.user))+';render()">'+T.articles_btn+(row.r?' ('+row.r.articles+')':'')+'</button>':'')+
-      (QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="EXPANDED=EXPANDED==='+esc(JSON.stringify(row.user))+'?null:'+esc(JSON.stringify(row.user))+';render()">'+T.comments+((row.a.comments||[]).length?' ('+row.a.comments.length+')':'')+'</button>':'')+'</td></tr>';
+  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="ARTOPEN=ARTOPEN==='+esc(JSON.stringify(row.user))+'?null:'+esc(JSON.stringify(row.user))+';render()">'+T.articles_btn+(row.r?' ('+row.r.articles+')':'')+'</button>':'')+'</td></tr>';
   if(QUAL&&ARTOPEN===row.user){
-   h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:640px">';
+   h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:760px">';
    const items=[];
    projects.forEach(p=>{const pp=row.r?row.r.perProject[p.host]:null;
     (pp&&pp.list?pp.list:[]).forEach(it=>items.push({...it,origin:p.origin,label:p.label}))});
    items.sort((a,b2)=>b2.bytes-a.bytes);
    if(!items.length)h+='<div class="hint">'+T.no_articles+'</div>';
    items.forEach(it=>{
-    h+='<div style="padding:6px 0;border-bottom:1px dashed var(--line);display:flex;align-items:center;gap:8px;flex-wrap:wrap">';
+    const ad=(row.pa&&row.pa[it.title])||{scores:{},comments:[]};
+    const vals=Object.values(ad.scores||{}).filter(v=>v!=null);
+    const avg=vals.length?(vals.reduce((x,y)=>x+y,0)/vals.length):null;
+    const my=(ad.scores||{})[JURY_LOGIN];
+    const cid=idFor(row.user+'||'+it.title);
+    h+='<div style="padding:10px 0;border-bottom:1px dashed var(--line)">';
+    h+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">';
     h+='<a class="wl" target="_blank" rel="noopener" href="'+articleLink(it.origin,it.title)+'">'+esc(it.title)+' ↗</a>';
     h+='<span class="chip" style="background:'+(it.created?'#e6f4ea':'var(--acc-soft)')+';color:'+(it.created?'#1d7a4f':'var(--acc)')+'">'+(it.created?T.created:T.expanded)+'</span>';
     h+='<span class="hint mono">'+it.label+' · +'+fmtN(it.bytes)+(LANG==='uk'?' Б':' B')+'</span>';
     h+='</div>';
+    h+='<div style="display:flex;align-items:center;gap:10px;margin-top:6px;flex-wrap:wrap">';
+    h+='<label class="hint" style="font-size:12px">'+T.th_my+':</label>';
+    h+='<input type="number" step="0.1" style="width:70px" value="'+(my??'')+'" onchange="saveScore('+esc(JSON.stringify(row.user))+','+esc(JSON.stringify(it.title))+',this.value)">';
+    h+='<span class="hint mono">'+T.th_avg+': '+(avg!=null?avg.toFixed(2):'—')+(vals.length?' ('+vals.length+' '+T.scores_n+')':'')+'</span>';
+    h+='</div>';
+    h+='<div style="margin-top:6px">';
+    (ad.comments||[]).forEach(c=>{h+='<div style="padding:4px 0"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span><div>'+esc(c.text)+'</div></div>'});
+    if(!(ad.comments||[]).length)h+='<div class="hint" style="font-size:12px">'+T.no_comments+'</div>';
+    h+='<div style="display:flex;gap:8px;margin-top:4px"><input id="cm_'+cid+'" placeholder="'+T.comment_ph+'" onkeydown="if(event.key===\\'Enter\\')saveComment('+esc(JSON.stringify(row.user))+','+esc(JSON.stringify(it.title))+')"><button class="btn-p" style="padding:4px 10px;font-size:12px" onclick="saveComment('+esc(JSON.stringify(row.user))+','+esc(JSON.stringify(it.title))+')">'+T.save+'</button></div>';
+    h+='</div>';
+    h+='</div>';
    });
-   h+='</div></td></tr>';
-  }
-  if(QUAL&&EXPANDED===row.user){
-   h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:640px">';
-   (row.a.comments||[]).forEach(c=>{h+='<div style="padding:6px 0;border-bottom:1px dashed var(--line)"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span><div>'+esc(c.text)+'</div></div>'});
-   if(!(row.a.comments||[]).length)h+='<div class="hint">'+T.no_comments+'</div>';
-   h+='<div style="display:flex;gap:8px;margin-top:8px"><input id="cm_'+idFor(row.user)+'" placeholder="'+T.comment_ph+'" onkeydown="if(event.key===\\'Enter\\')saveComment('+esc(JSON.stringify(row.user))+')"><button class="btn-p" onclick="saveComment('+esc(JSON.stringify(row.user))+')">'+T.save+'</button></div>';
    h+='</div></td></tr>';
   }
  });
@@ -629,16 +651,34 @@ def get_contests():
     return out
 
 def get_assess(cid):
+    """Оцінки та коментарі по кожній конкурсній статті окремо.
+    Структура: {учасник: {стаття: {"scores":{журі:бал}, "comments":[...]}}}"""
     assess = {}
-    for r in db().execute("SELECT * FROM scores WHERE contest_id=?", (cid,)):
-        assess.setdefault(r["participant"], {"scores": {}, "comments": []})
-        assess[r["participant"]]["scores"][r["jury"]] = r["value"]
+    for r in db().execute("SELECT * FROM article_scores WHERE contest_id=?", (cid,)):
+        p = assess.setdefault(r["participant"], {})
+        a = p.setdefault(r["article"], {"scores": {}, "comments": []})
+        a["scores"][r["jury"]] = r["value"]
     for r in db().execute(
-            "SELECT * FROM comments WHERE contest_id=? ORDER BY id", (cid,)):
-        assess.setdefault(r["participant"], {"scores": {}, "comments": []})
-        assess[r["participant"]]["comments"].append(
-            {"jury": r["jury_name"], "text": r["text"], "date": r["date"]})
+            "SELECT * FROM article_comments WHERE contest_id=? ORDER BY id", (cid,)):
+        p = assess.setdefault(r["participant"], {})
+        a = p.setdefault(r["article"], {"scores": {}, "comments": []})
+        a["comments"].append({"jury": r["jury_name"], "text": r["text"], "date": r["date"]})
     return assess
+
+def article_quality(participant_assess):
+    """Якість учасника = середнє арифметичне середніх оцінок по кожній статті
+    (спершу усереднюємо оцінки журі в межах статті, потім — по статтях)."""
+    if not participant_assess:
+        return 0.0, 0
+    article_avgs = []
+    n = 0
+    for a in participant_assess.values():
+        vals = [v for v in (a.get("scores") or {}).values() if v is not None]
+        if vals:
+            article_avgs.append(sum(vals) / len(vals))
+            n += len(vals)
+    quality = sum(article_avgs) / len(article_avgs) if article_avgs else 0.0
+    return quality, n
 
 class D(dict):
     __getattr__ = dict.get
@@ -768,13 +808,14 @@ def api_results(cid):
 @login_required
 def api_score():
     d = request.get_json()
+    article = d.get("article", "")
     if d.get("value") is None:
-        db().execute("DELETE FROM scores WHERE contest_id=? AND participant=? AND jury=?",
-                     (d["contest"], d["participant"], session["user"]["login"]))
+        db().execute("DELETE FROM article_scores WHERE contest_id=? AND participant=? AND article=? AND jury=?",
+                     (d["contest"], d["participant"], article, session["user"]["login"]))
     else:
-        db().execute("""INSERT INTO scores VALUES(?,?,?,?)
-            ON CONFLICT(contest_id,participant,jury) DO UPDATE SET value=excluded.value""",
-            (d["contest"], d["participant"], session["user"]["login"], float(d["value"])))
+        db().execute("""INSERT INTO article_scores VALUES(?,?,?,?,?)
+            ON CONFLICT(contest_id,participant,article,jury) DO UPDATE SET value=excluded.value""",
+            (d["contest"], d["participant"], article, session["user"]["login"], float(d["value"])))
     db().commit()
     return jsonify(ok=True)
 
@@ -782,8 +823,8 @@ def api_score():
 @login_required
 def api_comment():
     d = request.get_json()
-    db().execute("INSERT INTO comments(contest_id,participant,jury_name,text,date) VALUES(?,?,?,?,?)",
-                 (d["contest"], d["participant"], session["user"]["name"],
+    db().execute("INSERT INTO article_comments(contest_id,participant,article,jury_name,text,date) VALUES(?,?,?,?,?,?)",
+                 (d["contest"], d["participant"], d.get("article", ""), session["user"]["name"],
                   d["text"][:2000], time.strftime("%Y-%m-%d %H:%M")))
     db().commit()
     return jsonify(ok=True)
@@ -816,13 +857,16 @@ def export_csv(cid):
     rows = []
     for user in contest["participants"]:
         r = results.get(user)
-        a = assess.get(user, {"scores": {}, "comments": []})
-        vals = [v for v in a["scores"].values() if v is not None]
-        quality = sum(vals) / len(vals) if vals else 0
+        a = assess.get(user, {})
+        quality, n = article_quality(a)
         score = eval_formula(contest["formula"],
                              {"bytes": r["bytes"], "edits": r["edits"],
                               "articles": r["articles"], "quality": quality}) if r else None
-        rows.append((user, r, a, quality, len(vals), score))
+        all_comments = []
+        for art, ad in a.items():
+            for c in ad.get("comments", []):
+                all_comments.append(f"[{art}] {c['jury']} ({c['date']}): {c['text']}")
+        rows.append((user, r, all_comments, quality, n, score))
     rows.sort(key=lambda x: -(x[5] if (qual and x[5] is not None)
                               else (x[1]["bytes"] if x[1] else -1)))
 
@@ -834,7 +878,7 @@ def export_csv(cid):
     if qual:
         head += [t["th_avg"], t["th_score"], t["comments"]]
     w.writerow(head)
-    for i, (user, r, a, quality, n, score) in enumerate(rows, 1):
+    for i, (user, r, all_comments, quality, n, score) in enumerate(rows, 1):
         line = [i, user]
         if quant:
             line.append(r["bytes"] if r else "")
@@ -843,9 +887,9 @@ def export_csv(cid):
                 line.append(pp.get("bytes", t["err"]) if pp else "")
             line.append(f"{r['edits']} / {r['articles']}" if r else "")
         if qual:
-            line += [round(quality, 2) if n else "", 
+            line += [round(quality, 2) if n else "",
                      round(score, 2) if score is not None else "",
-                     " | ".join(f"{c['jury']} ({c['date']}): {c['text']}" for c in a["comments"])]
+                     " | ".join(all_comments)]
         w.writerow(line)
     safe = re.sub(r"[^\w \-]", "", contest["name"], flags=re.U).strip().replace(" ", "_") or "contest"
     ascii_fallback = re.sub(r"[^A-Za-z0-9_\-]", "", safe)
