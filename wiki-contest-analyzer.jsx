@@ -29,6 +29,7 @@ const T = {
     dateStart: "Початок періоду (необов'язково)", dateEnd: "Кінець періоду",
     tplLabel: "Шаблон конкурсу — ідентифікує статті кампанії",
     tplExtract: "Витягнути учасників із шаблону", tplExtracting: "Витягую…",
+    tplTalkOnly: "Шаблон розміщено на сторінці обговорення (шукати лише там, а не в статтях)",
     tplHint: "Інструмент знайде всі статті, що містять шаблон, і збере авторів редагувань у межах вказаних дат (боти відсіюються). Знайдені імена додаються до списку нижче — його можна відредагувати вручну.",
     tplBad: "Вставте коректне посилання на шаблон конкурсу",
     tplNone: "Жодна стаття не містить цього шаблону",
@@ -91,6 +92,7 @@ const T = {
     dateStart: "Period start (optional)", dateEnd: "Period end",
     tplLabel: "Contest template — identifies campaign articles",
     tplExtract: "Extract participants from template", tplExtracting: "Extracting…",
+    tplTalkOnly: "Template is placed on talk pages (search only there, not in articles)",
     tplHint: "The tool finds every article that transcludes the template and collects revision authors within the given dates (bots are filtered out). Found names are merged into the list below — you can edit it manually.",
     tplBad: "Paste a valid link to the contest template",
     tplNone: "No article transcludes this template",
@@ -246,13 +248,13 @@ async function talkNamespaceName(api) {
 // Шаблон конкурсу нерідко розміщують на сторінці обговорення статті,
 // а не на самій статті — тому шукаємо в обох просторах назв (0 і 1),
 // а знайдені сторінки обговорення перетворюємо на відповідні статті.
-async function fetchTemplatePages(api, title) {
+async function fetchTemplatePages(api, title, talkOnly) {
   let cont = null, guard = 0;
   const raw = [];
   do {
     const p = new URLSearchParams({
       action: "query", list: "embeddedin", eititle: title,
-      eilimit: "500", einamespace: "0|1", format: "json", origin: "*",
+      eilimit: "500", einamespace: talkOnly ? "1" : "0|1", format: "json", origin: "*",
     });
     if (cont) p.set("eicontinue", cont);
     const res = await fetch(api + "?" + p.toString());
@@ -462,6 +464,7 @@ function ContestAdmin({ contests, setContests, t }) {
   const [extLabel, setExtLabel] = useState("");
   const [extDone, setExtDone] = useState(0);
   const [extTotal, setExtTotal] = useState(0);
+  const [talkOnly, setTalkOnly] = useState(false);
 
   const startEdit = (c) => {
     setEditId(c.id);
@@ -485,7 +488,7 @@ function ContestAdmin({ contests, setContests, t }) {
       const startISO = draft.start ? new Date(draft.start + "T00:00:00Z").toISOString() : null;
       const endISO = draft.end ? new Date(draft.end + "T23:59:59Z").toISOString() : null;
       setExtLabel(t.tplSearch);
-      const pages = await fetchTemplatePages(tp.api, tp.title);
+      const pages = await fetchTemplatePages(tp.api, tp.title, talkOnly);
       if (!pages.length) {
         setMsg(t.tplNone);
         setExtracting(false); setExtLabel("");
@@ -568,6 +571,10 @@ function ContestAdmin({ contests, setContests, t }) {
           <input className="mono" style={{ fontSize: 12 }} value={draft.template}
             onChange={(e) => setDraft({ ...draft, template: e.target.value })}
             placeholder="https://uk.wikivoyage.org/wiki/Шаблон:Cultural_Heritage_and_Notable_Personalities_2026" />
+          <label className="hint" style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, cursor: "pointer" }}>
+            <input type="checkbox" style={{ width: "auto" }} checked={talkOnly}
+              onChange={(e) => setTalkOnly(e.target.checked)} /> {t.tplTalkOnly}
+          </label>
           <div style={{ marginTop: 8 }}>
             <button className="btn-p" onClick={extract} disabled={extracting}>
               {extracting ? t.tplExtracting : t.tplExtract}
