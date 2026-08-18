@@ -384,9 +384,18 @@ function isAnon(u){
  if(/^[0-9a-f]{1,4}(::?[0-9a-f]{0,4}){2,7}$/i.test(u))return true;
  return false;
 }
-async function mw(api,params){
+function sleep(ms){return new Promise(res=>setTimeout(res,ms))}
+async function mw(api,params,tries){
+ tries=tries||0;
  const p=new URLSearchParams({format:'json',origin:'*',...params});
- const r=await fetch(api+'?'+p);if(!r.ok)throw new Error('HTTP '+r.status);
+ const r=await fetch(api+'?'+p);
+ if(r.status===429||r.status===503){
+  if(tries>=6)throw new Error('HTTP '+r.status+' (ліміт запитів вікі, спроби вичерпано)');
+  const ra=parseFloat(r.headers.get('Retry-After'))||0;
+  await sleep(Math.max(ra*1000,800*Math.pow(2,tries)));
+  return mw(api,params,tries+1);
+ }
+ if(!r.ok)throw new Error('HTTP '+r.status);
  const d=await r.json();if(d.error)throw new Error(d.error.info||'API error');return d;
 }
 async function fetchContribs(api,user,startISO,endISO){
@@ -451,19 +460,23 @@ async function extractParticipants(){
  try{
   const pages=await templatePages(tp,talkOnly);
   const users=new Set();
+  let failed=0;
   for(let i=0;i<pages.length;i++){
    pbar(bar,i,pages.length,pages[i]);
-   const params={action:'query',prop:'revisions',titles:pages[i],rvprop:'user|timestamp',rvlimit:'500'};
-   if(sISO)params.rvend=sISO;if(eISO)params.rvstart=eISO;
-   const d=await mw(tp.api,params);
-   const page=Object.values(d.query?.pages||{})[0];
-   (page?.revisions||[]).forEach(r=>{if(r.user&&!/bot$|бот$/i.test(r.user.trim())&&!isAnon(r.user.trim()))users.add(r.user)});
+   try{
+    const params={action:'query',prop:'revisions',titles:pages[i],rvprop:'user|timestamp',rvlimit:'500'};
+    if(sISO)params.rvend=sISO;if(eISO)params.rvstart=eISO;
+    const d=await mw(tp.api,params);
+    const page=Object.values(d.query?.pages||{})[0];
+    (page?.revisions||[]).forEach(r=>{if(r.user&&!/bot$|бот$/i.test(r.user.trim())&&!isAnon(r.user.trim()))users.add(r.user)});
+   }catch(e){failed++}
+   if(i%5===4)await sleep(150);
   }
   pbar(bar,pages.length,pages.length,'');
   const ta=document.getElementById('parts');
   const existing=ta.value.split('\\n').map(s=>s.trim()).filter(Boolean);
   ta.value=[...new Set([...existing,...users])].sort((a,b)=>a.localeCompare(b)).join('\\n');
-  msg.textContent='✓ '+pages.length+' / '+users.size;
+  msg.textContent='✓ '+pages.length+' / '+users.size+(failed?' ('+failed+' сторінок пропущено через помилку)':'');
  }catch(err){msg.textContent='✗ '+err.message}
  btn.disabled=false;
 }
@@ -524,6 +537,7 @@ async function runCheck(){
       if('new' in r)pp._detail[tplPages[i]].created=true;
      });
     }catch(e){/* сторінку могли видалити/перейменувати — пропускаємо */}
+    if(i%5===4)await sleep(150);
    }
   }else{
    for(let i=0;i<CONTEST.participants.length;i++){
@@ -543,6 +557,7 @@ async function runCheck(){
      row.perProject[pr.host]={bytes:b,edits:cs.length,articles:new Set(cs.map(c=>c.title)).size,list};
      row.bytes+=b;row.edits+=cs.length;
     }catch(e){row.perProject[pr.host]={err:String(e.message||e)}}
+    if(i%5===4)await sleep(150);
    }
   }
  }
