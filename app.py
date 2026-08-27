@@ -464,11 +464,15 @@ async function extractParticipants(){
   for(let i=0;i<pages.length;i++){
    pbar(bar,i,pages.length,pages[i]);
    try{
-    const params={action:'query',prop:'revisions',titles:pages[i],rvprop:'user|timestamp',rvlimit:'500'};
-    if(sISO)params.rvend=sISO;if(eISO)params.rvstart=eISO;
-    const d=await mw(tp.api,params);
-    const page=Object.values(d.query?.pages||{})[0];
-    (page?.revisions||[]).forEach(r=>{if(r.user&&!/bot$|бот$/i.test(r.user.trim())&&!isAnon(r.user.trim()))users.add(r.user)});
+    // повна історія з diff, щоб додавати лише авторів із позитивним внеском (≥1 байт)
+    const revs=await pageRevisionsWithDiff(tp.api,pages[i]);
+    revs.forEach(r=>{
+     if(!r.timestamp)return;
+     if(sISO&&r.timestamp<sISO)return;
+     if(eISO&&r.timestamp>eISO)return;
+     if(!(r.diff>0))return;
+     if(r.user&&!/bot$|бот$/i.test(r.user.trim())&&!isAnon(r.user.trim()))users.add(r.user);
+    });
    }catch(e){failed++}
    if(i%5===4)await sleep(150);
   }
@@ -526,14 +530,16 @@ async function runCheck(){
       if(sISO&&r.timestamp<sISO)return;
       if(eISO&&r.timestamp>eISO)return;
       if(!r.user||!out[r.user])return; // рахуємо тільки офіційних учасників конкурсу
+      // лише позитивний внесок (≥1 байт)
+      if(!(r.diff>0))return;
       const row=out[r.user];
       if(!row.perProject[pr.host])row.perProject[pr.host]={bytes:0,edits:0,_titles:new Set(),_detail:{}};
       const pp=row.perProject[pr.host];
-      if(r.diff>0){pp.bytes+=r.diff;row.bytes+=r.diff}
+      pp.bytes+=r.diff;row.bytes+=r.diff;
       pp.edits++;row.edits++;
       pp._titles.add(tplPages[i]);row._titles.add(pr.host+'::'+tplPages[i]);
       if(!pp._detail[tplPages[i]])pp._detail[tplPages[i]]={bytes:0,created:false};
-      if(r.diff>0)pp._detail[tplPages[i]].bytes+=r.diff;
+      pp._detail[tplPages[i]].bytes+=r.diff;
       if('new' in r)pp._detail[tplPages[i]].created=true;
      });
     }catch(e){/* сторінку могли видалити/перейменувати — пропускаємо */}
@@ -543,19 +549,22 @@ async function runCheck(){
    for(let i=0;i<CONTEST.participants.length;i++){
     const user=CONTEST.participants[i];pbar(bar,done,totalSteps,user);done++;
     const row=out[user];
-    try{const cs=await fetchContribs(pr.api,user,sISO,eISO);let b=0;
-     const detail={};
+    try{const cs=await fetchContribs(pr.api,user,sISO,eISO);let b=0,ed=0;
+     const detail={}, titles=new Set();
      cs.forEach(c=>{
-      if(c.sizediff>0)b+=c.sizediff;
+      // лише позитивний внесок (≥1 байт)
+      if(!(c.sizediff>0))return;
+      b+=c.sizediff;ed++;
+      titles.add(c.title);
       row._titles.add(pr.host+'::'+c.title);
       if(!detail[c.title])detail[c.title]={bytes:0,created:false};
-      if(c.sizediff>0)detail[c.title].bytes+=c.sizediff;
+      detail[c.title].bytes+=c.sizediff;
       if('new' in c)detail[c.title].created=true;
      });
      const list=Object.entries(detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
       .sort((a,b2)=>b2.bytes-a.bytes);
-     row.perProject[pr.host]={bytes:b,edits:cs.length,articles:new Set(cs.map(c=>c.title)).size,list};
-     row.bytes+=b;row.edits+=cs.length;
+     row.perProject[pr.host]={bytes:b,edits:ed,articles:titles.size,list};
+     row.bytes+=b;row.edits+=ed;
     }catch(e){row.perProject[pr.host]={err:String(e.message||e)}}
     if(i%5===4)await sleep(150);
    }
@@ -564,15 +573,20 @@ async function runCheck(){
  Object.values(out).forEach(row=>{
   const pp=row.perProject[tplHost];
   if(pp&&pp._detail){
-   pp.list=Object.entries(pp._detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
+   // у list лише статті з позитивним внеском
+   pp.list=Object.entries(pp._detail).filter(([,d])=>d.bytes>0)
+    .map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
     .sort((a,b2)=>b2.bytes-a.bytes);
    pp.articles=pp._titles.size;delete pp._detail;delete pp._titles;
   }
   row.articles=row._titles.size;delete row._titles;
  });
+ // прибрати учасників з нульовим (або відсутнім) позитивним внеском
+ const filtered={};
+ Object.entries(out).forEach(([u,row])=>{if(row.bytes>0)filtered[u]=row});
  pbar(bar,totalSteps,totalSteps,'');
- RESULTS=out;
- await fetch('/api/results/'+CID,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(out)});
+ RESULTS=filtered;
+ await fetch('/api/results/'+CID,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(filtered)});
  btn.disabled=false;btn.textContent=T.check;render();
 }
 async function saveScore(user,article,val){
@@ -693,7 +707,12 @@ function contribLink(origin,user){return origin+'/wiki/Special:Contributions/'+e
 
 function render(){
  const el=document.getElementById('tbl');if(!CONTEST){el.innerHTML='';return}
- const rows=CONTEST.participants.map(user=>{
+ // після перевірки показуємо лише учасників із позитивним внеском (≥1 байт);
+ // до перевірки — увесь список (щоб було видно кого перевірятимуть)
+ const userList=RESULTS
+  ?Object.keys(RESULTS).filter(u=>RESULTS[u]&&RESULTS[u].bytes>0)
+  :CONTEST.participants;
+ const rows=userList.map(user=>{
   const r=RESULTS?RESULTS[user]:null;const pa=ASSESS[user]||{};
   const{quality,n}=articleQuality(pa);
   const score=r?evalFormula(CONTEST.formula,{bytes:r.bytes,edits:r.edits,articles:r.articles,quality}):null;
@@ -1057,8 +1076,10 @@ def contest_save():
 @admin_required
 def contest_delete():
     cid = request.form["id"]
-    for tbl in ("contests", "results", "scores", "comments"):
-        db().execute(f"DELETE FROM {tbl} WHERE {'id' if tbl=='contests' else 'contest_id'}=?", (cid,))
+    for tbl in ("contests", "results", "scores", "comments",
+                "article_scores", "article_comments"):
+        col = "id" if tbl == "contests" else "contest_id"
+        db().execute(f"DELETE FROM {tbl} WHERE {col}=?", (cid,))
     db().commit()
     return redirect(url_for("index", view="admin"))
 
@@ -1154,7 +1175,9 @@ def export_csv(cid):
             hosts.append(m.group(1))
 
     rows = []
-    for user in contest["participants"]:
+    # якщо є результати — експортуємо лише учасників із позитивним внеском (≥1 байт)
+    user_list = [u for u, r in results.items() if r and r.get("bytes", 0) > 0] if results else contest["participants"]
+    for user in user_list:
         r = results.get(user)
         a = assess.get(user, {})
         quality, n = article_quality(a)
