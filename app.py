@@ -156,7 +156,10 @@ T = {
    f_of="Формула конкурсу:", saved="Збережено ✓",
    articles_btn="Статті", no_articles="У межах конкурсу немає редагувань статей.",
    created="створено", expanded="доповнено",
+   filter_all="Усі", filter_created="Лише нові", filter_expanded="Лише доповнені",
+   jury_no_check="Запуск перевірки доступний адміну. Результати вже завантажені.",
    view="Переглянути", open_article="Відкрити статтю", loading="Завантаження…",
+   my_pass_title="Мій пароль",
    footer="Кількісний внесок = сума доданих байтів через API MediaWiki."),
  "en": dict(brand="WikiRank", tagline="Contribution analysis for wiki contests. Admins and jury only.",
    login="Login", password="Password", signin="Sign in", bad="Wrong login or password",
@@ -191,7 +194,10 @@ T = {
    f_of="Contest formula:", saved="Saved ✓",
    articles_btn="Articles", no_articles="No article edits within the contest scope.",
    created="created", expanded="expanded",
+   filter_all="All", filter_created="New only", filter_expanded="Expanded only",
+   jury_no_check="Running the check is admin-only. Results are already loaded.",
    view="View", open_article="Open article", loading="Loading…",
+   my_pass_title="My password",
    footer="Quantitative contribution = sum of added bytes via the MediaWiki API."),
  "pl": dict(brand="WikiRank", tagline="Analiza wkładu uczestników konkursów wiki. Dostęp tylko dla adminów i jury.",
    login="Login", password="Hasło", signin="Zaloguj się", bad="Nieprawidłowy login lub hasło",
@@ -226,7 +232,10 @@ T = {
    f_of="Formuła konkursu:", saved="Zapisano ✓",
    articles_btn="Artykuły", no_articles="Brak edycji artykułów w ramach konkursu.",
    created="utworzono", expanded="rozbudowano",
+   filter_all="Wszystkie", filter_created="Tylko nowe", filter_expanded="Tylko rozbudowane",
+   jury_no_check="Uruchomienie sprawdzenia dostępne tylko dla admina. Wyniki są już załadowane.",
    view="Zobacz", open_article="Otwórz artykuł", loading="Ładowanie…",
+   my_pass_title="Moje hasło",
    footer="Wkład ilościowy = suma dodanych bajtów przez API MediaWiki."),
 }
 
@@ -464,15 +473,11 @@ async function extractParticipants(){
   for(let i=0;i<pages.length;i++){
    pbar(bar,i,pages.length,pages[i]);
    try{
-    // повна історія з diff, щоб додавати лише авторів із позитивним внеском (≥1 байт)
-    const revs=await pageRevisionsWithDiff(tp.api,pages[i]);
-    revs.forEach(r=>{
-     if(!r.timestamp)return;
-     if(sISO&&r.timestamp<sISO)return;
-     if(eISO&&r.timestamp>eISO)return;
-     if(!(r.diff>0))return;
-     if(r.user&&!/bot$|бот$/i.test(r.user.trim())&&!isAnon(r.user.trim()))users.add(r.user);
-    });
+    const params={action:'query',prop:'revisions',titles:pages[i],rvprop:'user|timestamp',rvlimit:'500'};
+    if(sISO)params.rvend=sISO;if(eISO)params.rvstart=eISO;
+    const d=await mw(tp.api,params);
+    const page=Object.values(d.query?.pages||{})[0];
+    (page?.revisions||[]).forEach(r=>{if(r.user&&!/bot$|бот$/i.test(r.user.trim())&&!isAnon(r.user.trim()))users.add(r.user)});
    }catch(e){failed++}
    if(i%5===4)await sleep(150);
   }
@@ -530,16 +535,14 @@ async function runCheck(){
       if(sISO&&r.timestamp<sISO)return;
       if(eISO&&r.timestamp>eISO)return;
       if(!r.user||!out[r.user])return; // рахуємо тільки офіційних учасників конкурсу
-      // лише позитивний внесок (≥1 байт)
-      if(!(r.diff>0))return;
       const row=out[r.user];
       if(!row.perProject[pr.host])row.perProject[pr.host]={bytes:0,edits:0,_titles:new Set(),_detail:{}};
       const pp=row.perProject[pr.host];
-      pp.bytes+=r.diff;row.bytes+=r.diff;
+      if(r.diff>0){pp.bytes+=r.diff;row.bytes+=r.diff}
       pp.edits++;row.edits++;
       pp._titles.add(tplPages[i]);row._titles.add(pr.host+'::'+tplPages[i]);
       if(!pp._detail[tplPages[i]])pp._detail[tplPages[i]]={bytes:0,created:false};
-      pp._detail[tplPages[i]].bytes+=r.diff;
+      if(r.diff>0)pp._detail[tplPages[i]].bytes+=r.diff;
       if('new' in r)pp._detail[tplPages[i]].created=true;
      });
     }catch(e){/* сторінку могли видалити/перейменувати — пропускаємо */}
@@ -549,22 +552,19 @@ async function runCheck(){
    for(let i=0;i<CONTEST.participants.length;i++){
     const user=CONTEST.participants[i];pbar(bar,done,totalSteps,user);done++;
     const row=out[user];
-    try{const cs=await fetchContribs(pr.api,user,sISO,eISO);let b=0,ed=0;
-     const detail={}, titles=new Set();
+    try{const cs=await fetchContribs(pr.api,user,sISO,eISO);let b=0;
+     const detail={};
      cs.forEach(c=>{
-      // лише позитивний внесок (≥1 байт)
-      if(!(c.sizediff>0))return;
-      b+=c.sizediff;ed++;
-      titles.add(c.title);
+      if(c.sizediff>0)b+=c.sizediff;
       row._titles.add(pr.host+'::'+c.title);
       if(!detail[c.title])detail[c.title]={bytes:0,created:false};
-      detail[c.title].bytes+=c.sizediff;
+      if(c.sizediff>0)detail[c.title].bytes+=c.sizediff;
       if('new' in c)detail[c.title].created=true;
      });
      const list=Object.entries(detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
       .sort((a,b2)=>b2.bytes-a.bytes);
-     row.perProject[pr.host]={bytes:b,edits:ed,articles:titles.size,list};
-     row.bytes+=b;row.edits+=ed;
+     row.perProject[pr.host]={bytes:b,edits:cs.length,articles:new Set(cs.map(c=>c.title)).size,list};
+     row.bytes+=b;row.edits+=cs.length;
     }catch(e){row.perProject[pr.host]={err:String(e.message||e)}}
     if(i%5===4)await sleep(150);
    }
@@ -573,20 +573,15 @@ async function runCheck(){
  Object.values(out).forEach(row=>{
   const pp=row.perProject[tplHost];
   if(pp&&pp._detail){
-   // у list лише статті з позитивним внеском
-   pp.list=Object.entries(pp._detail).filter(([,d])=>d.bytes>0)
-    .map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
+   pp.list=Object.entries(pp._detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
     .sort((a,b2)=>b2.bytes-a.bytes);
    pp.articles=pp._titles.size;delete pp._detail;delete pp._titles;
   }
   row.articles=row._titles.size;delete row._titles;
  });
- // прибрати учасників з нульовим (або відсутнім) позитивним внеском
- const filtered={};
- Object.entries(out).forEach(([u,row])=>{if(row.bytes>0)filtered[u]=row});
  pbar(bar,totalSteps,totalSteps,'');
- RESULTS=filtered;
- await fetch('/api/results/'+CID,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(filtered)});
+ RESULTS=out;
+ await fetch('/api/results/'+CID,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(out)});
  btn.disabled=false;btn.textContent=T.check;render();
 }
 async function saveScore(user,article,val){
@@ -602,6 +597,8 @@ async function saveComment(user,article){
  const r=await fetch('/api/state/'+CID);ASSESS=(await r.json()).assess;render();
 }
 let ARTOPEN=null;
+let ART_FILTER='all'; // 'all' | 'created' | 'expanded'
+function setArtFilter(f){ART_FILTER=f;render()}
 function articleLink(origin,title){return origin+'/wiki/'+encodeURIComponent(title.replace(/ /g,'_'))}
 
 // ── Модальне прев'ю статті: превʼю зліва, оцінка/коментарі справа ──
@@ -707,12 +704,7 @@ function contribLink(origin,user){return origin+'/wiki/Special:Contributions/'+e
 
 function render(){
  const el=document.getElementById('tbl');if(!CONTEST){el.innerHTML='';return}
- // після перевірки показуємо лише учасників із позитивним внеском (≥1 байт);
- // до перевірки — увесь список (щоб було видно кого перевірятимуть)
- const userList=RESULTS
-  ?Object.keys(RESULTS).filter(u=>RESULTS[u]&&RESULTS[u].bytes>0)
-  :CONTEST.participants;
- const rows=userList.map(user=>{
+ const rows=CONTEST.participants.map(user=>{
   const r=RESULTS?RESULTS[user]:null;const pa=ASSESS[user]||{};
   const{quality,n}=articleQuality(pa);
   const score=r?evalFormula(CONTEST.formula,{bytes:r.bytes,edits:r.edits,articles:r.articles,quality}):null;
@@ -749,10 +741,20 @@ function render(){
    if(!items.length)h+='<div class="hint">'+T.no_articles+'</div>';
    else{
     if(items[0])prefetchThumbs(items[0].api,items[0].host,items.map(i=>i.title));
+    // кнопки фільтрів
+    h+='<div style="display:flex;gap:6px;margin-bottom:8px">';
+    [['all',T.filter_all],['created',T.filter_created],['expanded',T.filter_expanded]].forEach(([f,lbl])=>{
+     h+='<button class="btn-s art-filt-btn" data-f="'+f+'" style="padding:3px 10px;font-size:12px'+(ART_FILTER===f?';background:var(--grad-dark);color:#fff':'')+'">'+ esc(lbl)+'</button>';
+    });
+    h+='</div>';
+    // фільтруємо
+    const filtered=ART_FILTER==='all'?items:items.filter(it=>ART_FILTER==='created'?it.created:!it.created);
+    if(!filtered.length)h+='<div class="hint">'+T.no_articles+'</div>';
+    else{
     h+='<div class="carousel-wrap">';
     h+='<button class="car-nav prev" onclick="this.nextElementSibling.scrollBy({left:-320,behavior:\\'smooth\\'})">‹</button>';
     h+='<div class="carousel">';
-    items.forEach(it=>{
+    filtered.forEach(it=>{
      const ad=(row.pa&&row.pa[it.title])||{scores:{},comments:[]};
      const vals=Object.values(ad.scores||{}).filter(v=>v!=null);
      const avg=vals.length?(vals.reduce((x,y)=>x+y,0)/vals.length):null;
@@ -772,12 +774,14 @@ function render(){
     h+='</div>';
     h+='<button class="car-nav next" onclick="this.previousElementSibling.scrollBy({left:320,behavior:\\'smooth\\'})">›</button>';
     h+='</div>';
-   }
+    } // end if filtered.length
+   } // end else items.length
    h+='</div></td></tr>';
   }
  });
  h+='</tbody></table>';
  el.innerHTML=h;
+ el.querySelectorAll('.art-filt-btn').forEach(b=>{b.onclick=function(){setArtFilter(this.dataset.f)}});
  document.getElementById('csvlink').href='/export/'+CID+'.csv?quant='+(QUANT?1:0)+'&qual='+(QUAL?1:0);
  renderModal();
 }
@@ -905,13 +909,27 @@ ANALYSIS_TPL = """
  <div style="margin-left:auto;text-align:right;min-width:280px">
   <div style="display:flex;gap:8px;justify-content:flex-end">
    <a id="csvlink" class="btn-s" style="text-decoration:none;padding:8px 14px" href="/export/{{cid}}.csv?quant=1&qual=0">{{t.export}}</a>
+   {% if me.role=='admin' %}
    <button id="runbtn" class="btn-p" onclick="runCheck()">{{t.check}}</button>
+   {% else %}
+   <span class="hint" style="align-self:center;font-size:11px;max-width:200px;text-align:right">{{t.jury_no_check}}</span>
+   {% endif %}
   </div>
   <div id="runbar" style="margin-top:6px"></div>
  </div>
 </div>
 <div class="card" style="padding:0;overflow-x:auto"><div id="tbl"></div></div>
 <div class="hint">{{t.f_of}} <span class="chip">{{contest.formula}}</span></div>
+{% endif %}
+{% if me.role=='jury' %}
+<div class="card" style="max-width:400px;margin-top:14px">
+ <h3 style="margin-top:0">{{t.my_pass_title}} — {{me.name}}</h3>
+ <form method="post" action="{{url_for('change_password')}}">
+  <label class="lbl">{{t.new_pass}}</label><input name="p1" type="password" required minlength="4">
+  <label class="lbl">{{t.again}}</label><input name="p2" type="password" required minlength="4">
+  <button class="btn-p" style="margin-top:12px">{{t.save}}</button>
+ </form>
+</div>
 {% endif %}
 """
 
@@ -1076,10 +1094,8 @@ def contest_save():
 @admin_required
 def contest_delete():
     cid = request.form["id"]
-    for tbl in ("contests", "results", "scores", "comments",
-                "article_scores", "article_comments"):
-        col = "id" if tbl == "contests" else "contest_id"
-        db().execute(f"DELETE FROM {tbl} WHERE {col}=?", (cid,))
+    for tbl in ("contests", "results", "scores", "comments"):
+        db().execute(f"DELETE FROM {tbl} WHERE {'id' if tbl=='contests' else 'contest_id'}=?", (cid,))
     db().commit()
     return redirect(url_for("index", view="admin"))
 
@@ -1175,9 +1191,7 @@ def export_csv(cid):
             hosts.append(m.group(1))
 
     rows = []
-    # якщо є результати — експортуємо лише учасників із позитивним внеском (≥1 байт)
-    user_list = [u for u, r in results.items() if r and r.get("bytes", 0) > 0] if results else contest["participants"]
-    for user in user_list:
+    for user in contest["participants"]:
         r = results.get(user)
         a = assess.get(user, {})
         quality, n = article_quality(a)
