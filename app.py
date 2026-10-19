@@ -94,6 +94,8 @@ def init_db():
     cols = [r[1] for r in con.execute("PRAGMA table_info(contests)")]
     if "tpl_talk_only" not in cols:
         con.execute("ALTER TABLE contests ADD COLUMN tpl_talk_only INTEGER DEFAULT 0")
+    if "review_scope" not in cols:
+        con.execute("ALTER TABLE contests ADD COLUMN review_scope TEXT DEFAULT 'all'")
     cur = con.execute("SELECT COUNT(*) c FROM users")
     if cur.fetchone()[0] == 0:
         con.execute("INSERT INTO users VALUES(?,?,?,?)",
@@ -320,6 +322,15 @@ T["en"].update(legacy_title="Reviewed before the update",
 T["uk"].update(my_progress_title="Мій прогрес")
 T["en"].update(my_progress_title="My progress")
 T["pl"].update(my_progress_title="Mój postęp")
+T["uk"].update(review_scope="Що перевіряє журі", scope_all="Усі статті", scope_created="Лише нові статті",
+               scope_expanded="Лише доповнення", scope_label="Перевірка:",
+               scope_h="Обмежує якісну перевірку: розподіл, перелік статей, прогрес і якість враховують лише обрані статті. Кількісний внесок не змінюється.")
+T["en"].update(review_scope="What the jury reviews", scope_all="All articles", scope_created="New articles only",
+               scope_expanded="Expansions only", scope_label="Review:",
+               scope_h="Limits the qualitative review: distribution, article list, progress and quality use only the chosen articles. Quantitative contribution is unchanged.")
+T["pl"].update(review_scope="Co sprawdza jury", scope_all="Wszystkie artykuły", scope_created="Tylko nowe artykuły",
+               scope_expanded="Tylko rozbudowy", scope_label="Sprawdzanie:",
+               scope_h="Ogranicza ocenę jakościową: podział, lista artykułów, postęp i jakość uwzględniają tylko wybrane artykuły. Wkład ilościowy się nie zmienia.")
 T["uk"].update(hidden_min="Приховано учасників із внеском менше мінімального порогу")
 T["en"].update(hidden_min="Participants hidden for contributing less than the minimum")
 T["pl"].update(hidden_min="Ukryci uczestnicy z wkładem poniżej minimalnego progu")
@@ -702,8 +713,10 @@ let CUR_LIST=[];      // поточний відфільтрований спи�
 let SCROLL_RESET=false;
 let MTAB='article';   // 'preview' | 'article' | 'history'
 const JURY_LIST={{juryjson|safe}};
+const SCOPE={{((contest.review_scope or 'all') if contest else 'all')|tojson}};
 const MIN_BYTES={{min_bytes}}; // мінімальний внесок для участі в рейтингу
 const LEGACY={{ljson|safe}}; // оцінки/коментарі з попередньої версії (рівень учасника)
+function inScope(it){return SCOPE==='all'||(SCOPE==='created')===!!it.created}
 function legacyDone(user){const l=LEGACY[user];return !!(l&&(Object.keys(l.scores||{}).length||(l.comments||[]).length))}
 function legacyVals(user){const l=LEGACY[user];return l?Object.values(l.scores||{}).filter(v=>v!=null):[]}
 function setArtFilter(f){ART_FILTER=f;SCROLL_RESET=true;render()}
@@ -897,10 +910,11 @@ function renderModal(){
  const nw=rt.querySelector('.md-cm');
  if(nw&&same){nw.value=draft;if(hadFocus)nw.focus()}
 }
-function articleQuality(pa,user){
+function articleQuality(pa,user,allowed){
  if(!pa)return{quality:0,n:0};
  const avgs=[];let n=0;
- Object.values(pa).forEach(a=>{
+ Object.entries(pa).forEach(([ttl,a])=>{
+  if(allowed&&!allowed.has(ttl))return;
   const vals=Object.values(a.scores||{}).filter(v=>v!=null);
   if(vals.length){avgs.push(vals.reduce((x,y)=>x+y,0)/vals.length);n+=vals.length}
  });
@@ -924,7 +938,7 @@ function splitStats(r){
 }
 function partTitles(r){
  const s=new Set();
- if(r)Object.values(r.perProject||{}).forEach(pp=>(pp.list||[]).forEach(it=>s.add(it.title)));
+ if(r)Object.values(r.perProject||{}).forEach(pp=>(pp.list||[]).forEach(it=>{if(inScope(it))s.add(it.title)}));
  return[...s];
 }
 function fmtN(n){return n==null?'—':n.toLocaleString(LANG==='uk'?'uk-UA':'en-GB')}
@@ -940,7 +954,7 @@ function render(){
  CUR_LIST=[];
  const allRows=CONTEST.participants.map(user=>{
   const r=RESULTS?RESULTS[user]:null;const pa=ASSESS[user]||{};
-  const{quality,n}=articleQuality(pa,user);
+  const{quality,n}=articleQuality(pa,user,(SCOPE!=='all'&&r)?new Set(partTitles(r)):null);
   const sp=splitStats(r);
   const score=r?evalFormula(CONTEST.formula,{bytes:r.bytes,edits:r.edits,articles:r.articles,quality,created:sp.created,expanded:sp.expanded}):null;
   const titles=partTitles(r);
@@ -989,7 +1003,7 @@ function render(){
    }
    const items=[];
    projects.forEach(p=>{const pp=row.r?row.r.perProject[p.host]:null;
-    (pp&&pp.list?pp.list:[]).forEach(it=>items.push({...it,origin:p.origin,label:p.label,host:p.host,api:p.api}))});
+    (pp&&pp.list?pp.list:[]).filter(inScope).forEach(it=>items.push({...it,origin:p.origin,label:p.label,host:p.host,api:p.api}))});
    // спершу неперевірені мною, серед них — призначені мені, далі за приростом байтів
    items.sort((a,b2)=>{
     const ra=isReviewed(row.user,a.title)?1:0,rb=isReviewed(row.user,b2.title)?1:0;
@@ -1007,11 +1021,14 @@ function render(){
     const nDone=items.filter(it=>isReviewed(row.user,it.title)).length;
     const nMine=items.filter(it=>isMine(row.user,it.title)).length;
     const btn=(cls,f,cur,lbl)=>'<button class="btn-s '+cls+'" data-f="'+f+'" style="padding:3px 10px;font-size:12px'+(cur===f?';background:var(--grad-dark);color:#fff':'')+'">'+esc(lbl)+'</button>';
-    h+='<div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">';
-    h+=btn('art-filt-btn','all',ART_FILTER,T.filter_all+' ('+items.length+')');
-    h+=btn('art-filt-btn','created',ART_FILTER,T.filter_created+' ('+nC+')');
-    h+=btn('art-filt-btn','expanded',ART_FILTER,T.filter_expanded+' ('+nE+')');
-    h+='</div><div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">';
+    if(SCOPE==='all'){
+     h+='<div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">';
+     h+=btn('art-filt-btn','all',ART_FILTER,T.filter_all+' ('+items.length+')');
+     h+=btn('art-filt-btn','created',ART_FILTER,T.filter_created+' ('+nC+')');
+     h+=btn('art-filt-btn','expanded',ART_FILTER,T.filter_expanded+' ('+nE+')');
+     h+='</div>';
+    }
+    h+='<div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">';
     h+=btn('rev-filt-btn','all',REV_FILTER,T.filter_all);
     h+=btn('rev-filt-btn','todo',REV_FILTER,T.filter_todo+' ('+(items.length-nDone)+')');
     h+=btn('rev-filt-btn','done',REV_FILTER,T.filter_done+' ('+nDone+')');
@@ -1114,6 +1131,11 @@ ADMIN_TPL = """
    </div>
    <label class="lbl">{{t.parts}}</label>
    <textarea id="parts" name="participants" rows="6">{{'\n'.join(edit_contest.participants) if edit_contest else ''}}</textarea>
+   <label class="lbl">{{t.review_scope}}</label>
+   <select name="review_scope">
+    {% for k in ['all','created','expanded'] %}<option value="{{k}}" {{'selected' if (edit_contest.review_scope if edit_contest else 'all')==k else ''}}>{{t['scope_'~k]}}</option>{% endfor %}
+   </select>
+   <div class="hint">{{t.scope_h}}</div>
    <label class="lbl">{{t.formula}}</label>
    <input name="formula" class="mono" value="{{edit_contest.formula if edit_contest else 'bytes / 1000 + quality * 10'}}">
    <div class="hint">{{t.formula_h}}</div>
@@ -1219,7 +1241,7 @@ ANALYSIS_TPL = """
  <div id="loadtbl" style="margin-top:8px"></div>
 </div>
 <div class="card" style="padding:0;overflow-x:auto"><div id="tbl"></div></div>
-<div class="hint">{{t.f_of}} <span class="chip">{{contest.formula}}</span></div>
+<div class="hint">{{t.f_of}} <span class="chip">{{contest.formula}}</span> · {{t.scope_label}} <span class="chip">{{t['scope_'~(contest.review_scope or 'all')]}}</span></div>
 {% endif %}
 {% if me.role=='jury' %}
 <div class="card" style="max-width:400px;margin-top:14px">
@@ -1305,13 +1327,26 @@ def get_legacy(cid):
             {"jury": r["jury_name"], "text": r["text"], "date": r["date"]})
     return out
 
-def article_quality(participant_assess, legacy=None):
+def in_scope(it, scope):
+    """Чи входить стаття (запис зі списку внеску) до обраного адміном обсягу перевірки."""
+    return scope == "all" or (scope == "created") == bool(it.get("created"))
+
+def scope_titles(r, scope):
+    """Назви статей учасника в обсязі перевірки (None = без обмежень)."""
+    if scope == "all" or not r:
+        return None
+    return {it.get("title") for pp in (r.get("perProject") or {}).values()
+            for it in (pp.get("list") or []) if in_scope(it, scope)}
+
+def article_quality(participant_assess, legacy=None, allowed=None):
     """Якість учасника = середнє арифметичне середніх оцінок по кожній статті
     (спершу усереднюємо оцінки журі в межах статті, потім — по статтях).
     Якщо оцінок по статтях немає, але є оцінки з попередньої версії — беремо їх середнє."""
     article_avgs = []
     n = 0
-    for a in (participant_assess or {}).values():
+    for art, a in (participant_assess or {}).items():
+        if allowed is not None and art not in allowed:
+            continue
         vals = [v for v in (a.get("scores") or {}).values() if v is not None]
         if vals:
             article_avgs.append(sum(vals) / len(vals))
@@ -1427,14 +1462,15 @@ def contest_save():
     if not validate_formula(formula):
         formula = "bytes / 1000 + quality * 10"
     cid = f.get("id") or "c" + hex(int(time.time() * 1000))[2:]
-    db().execute("""INSERT INTO contests VALUES(?,?,?,?,?,?,?,?,?)
+    scope = f.get("review_scope") if f.get("review_scope") in ("all", "created", "expanded") else "all"
+    db().execute("""INSERT INTO contests VALUES(?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET name=excluded.name,template=excluded.template,
         projects=excluded.projects,participants=excluded.participants,
         formula=excluded.formula,start=excluded.start,end=excluded.end,
-        tpl_talk_only=excluded.tpl_talk_only""",
+        tpl_talk_only=excluded.tpl_talk_only,review_scope=excluded.review_scope""",
         (cid, f.get("name", "").strip(), f.get("template", "").strip(),
          json.dumps(projects), json.dumps(participants), formula,
-         f.get("start", ""), f.get("end", ""), 1 if f.get("tpl_talk_only") else 0))
+         f.get("start", ""), f.get("end", ""), 1 if f.get("tpl_talk_only") else 0, scope))
     db().commit()
     return redirect(url_for("index", view="admin", contest=cid, msg=T[lang()]["saved"]))
 
@@ -1544,6 +1580,8 @@ def api_distribute(cid):
     results = json.loads(rr["data"]) if rr else {}
     items, seen = [], set()
     legacy = get_legacy(cid)
+    srow = con.execute("SELECT review_scope FROM contests WHERE id=?", (cid,)).fetchone()
+    scope = (srow["review_scope"] if srow else None) or "all"
     for user in sorted(results):
         if user in legacy and (legacy[user]["scores"] or legacy[user]["comments"]):
             continue  # внесок уже перевірено в попередній версії
@@ -1551,6 +1589,8 @@ def api_distribute(cid):
             continue  # внесок нижчий за мінімальний поріг
         for pp in ((results[user] or {}).get("perProject") or {}).values():
             for it in (pp.get("list") or []):
+                if not in_scope(it, scope):
+                    continue
                 k = (user, it.get("title", ""))
                 if k[1] and k not in seen:
                     seen.add(k)
@@ -1614,6 +1654,7 @@ def export_csv(cid):
     results = json.loads(rr["data"]) if rr else {}
     assess = get_assess(cid)
     legacy = get_legacy(cid)
+    scope = contest.get("review_scope") or "all"
     hosts = []
     for p in contest["projects"]:
         m = re.match(r"https?://([^/]+)", p)
@@ -1626,7 +1667,8 @@ def export_csv(cid):
         if r and (r.get("bytes") or 0) < MIN_BYTES:
             continue  # нижче мінімального порогу
         a = assess.get(user, {})
-        quality, n = article_quality(a, legacy.get(user))
+        allowed = scope_titles(r, scope)
+        quality, n = article_quality(a, legacy.get(user), allowed)
         sp = split_stats(r)
         score = eval_formula(contest["formula"],
                              {"bytes": r["bytes"], "edits": r["edits"],
@@ -1635,6 +1677,8 @@ def export_csv(cid):
         all_comments = [f"[{t['legacy_title']}] {c['jury']} ({c['date']}): {c['text']}"
                         for c in (legacy.get(user) or {}).get("comments", [])]
         for art, ad in a.items():
+            if allowed is not None and art not in allowed:
+                continue
             for c in ad.get("comments", []):
                 all_comments.append(f"[{art}] {c['jury']} ({c['date']}): {c['text']}")
         rows.append((user, r, all_comments, quality, n, score))
