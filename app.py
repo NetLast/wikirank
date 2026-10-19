@@ -109,6 +109,8 @@ _OPS = {ast.Add: operator.add, ast.Sub: operator.sub,
         ast.USub: operator.neg, ast.UAdd: operator.pos,
         ast.Pow: operator.pow}
 FORMULA_VARS = ("bytes", "edits", "articles", "quality", "created", "expanded")
+# мінімальний внесок: учасники з меншою сумою доданих байтів не потрапляють у рейтинг
+MIN_BYTES = 1000
 
 def eval_formula(expr, variables):
     def _ev(node):
@@ -318,6 +320,9 @@ T["en"].update(legacy_title="Reviewed before the update",
 T["uk"].update(my_progress_title="Мій прогрес")
 T["en"].update(my_progress_title="My progress")
 T["pl"].update(my_progress_title="Mój postęp")
+T["uk"].update(hidden_min="Приховано учасників із внеском менше мінімального порогу")
+T["en"].update(hidden_min="Participants hidden for contributing less than the minimum")
+T["pl"].update(hidden_min="Ukryci uczestnicy z wkładem poniżej minimalnego progu")
 T["pl"].update(legacy_title="Sprawdzono przed aktualizacją",
                legacy_h="Ten wkład oceniono w poprzedniej wersji: ocena liczy się do jakości, a artykuły nie są rozdzielane.")
 
@@ -697,6 +702,7 @@ let CUR_LIST=[];      // поточний відфільтрований спи�
 let SCROLL_RESET=false;
 let MTAB='article';   // 'preview' | 'article' | 'history'
 const JURY_LIST={{juryjson|safe}};
+const MIN_BYTES={{min_bytes}}; // мінімальний внесок для участі в рейтингу
 const LEGACY={{ljson|safe}}; // оцінки/коментарі з попередньої версії (рівень учасника)
 function legacyDone(user){const l=LEGACY[user];return !!(l&&(Object.keys(l.scores||{}).length||(l.comments||[]).length))}
 function legacyVals(user){const l=LEGACY[user];return l?Object.values(l.scores||{}).filter(v=>v!=null):[]}
@@ -932,7 +938,7 @@ function render(){
  const oldCar=el.querySelector('.carousel');
  const keepScroll=(oldCar&&!SCROLL_RESET)?oldCar.scrollLeft:0;SCROLL_RESET=false;
  CUR_LIST=[];
- const rows=CONTEST.participants.map(user=>{
+ const allRows=CONTEST.participants.map(user=>{
   const r=RESULTS?RESULTS[user]:null;const pa=ASSESS[user]||{};
   const{quality,n}=articleQuality(pa,user);
   const sp=splitStats(r);
@@ -943,6 +949,8 @@ function render(){
   const mineDone=mineT.filter(t=>isReviewed(user,t)).length;
   return{user,r,pa,quality,n,score,sp,total:titles.length,done,mine:mineT.length,mineDone};
  }).sort((x,y)=>QUAL?((y.score??-1e18)-(x.score??-1e18)):((y.r?y.r.bytes:-1)-(x.r?x.r.bytes:-1)));
+ const hiddenN=allRows.filter(x=>x.r&&x.r.bytes<MIN_BYTES).length;
+ const rows=allRows.filter(x=>!(x.r&&x.r.bytes<MIN_BYTES));
  ROWS_CUR=rows;
  const maxB=Math.max(1,...rows.map(r=>r.r?r.r.bytes:0));
  let h='<table><thead><tr><th>#</th><th>'+T.th_u+'</th>';
@@ -1053,6 +1061,7 @@ function render(){
   }
  });
  h+='</tbody></table>';
+ if(hiddenN)h+='<div class="hint" style="padding:8px 12px">'+T.hidden_min+' ('+fmtN(MIN_BYTES)+(LANG==='uk'?' Б':' B')+'): '+hiddenN+'</div>';
  el.innerHTML=h;
  const nc=el.querySelector('.carousel');if(nc&&keepScroll)nc.scrollLeft=keepScroll;
  el.querySelectorAll('.art-filt-btn').forEach(b=>{b.onclick=function(){setArtFilter(this.dataset.f)}});
@@ -1401,7 +1410,7 @@ def index():
         tjson=json.dumps(T[l], ensure_ascii=False),
         cjson=json.dumps(contest, ensure_ascii=False) if contest else "null",
         rjson=json.dumps(results, ensure_ascii=False) if results else "null",
-        ajson=json.dumps(assess, ensure_ascii=False),
+        ajson=json.dumps(assess, ensure_ascii=False), min_bytes=MIN_BYTES,
         juryjson=json.dumps([{"login": u.login, "name": u.name, "role": u.role} for u in users
                              if me.role == "admin" or u.login == me.login],
                             ensure_ascii=False).replace("</", "<\\/"),
@@ -1538,6 +1547,8 @@ def api_distribute(cid):
     for user in sorted(results):
         if user in legacy and (legacy[user]["scores"] or legacy[user]["comments"]):
             continue  # внесок уже перевірено в попередній версії
+        if ((results[user] or {}).get("bytes") or 0) < MIN_BYTES:
+            continue  # внесок нижчий за мінімальний поріг
         for pp in ((results[user] or {}).get("perProject") or {}).values():
             for it in (pp.get("list") or []):
                 k = (user, it.get("title", ""))
@@ -1612,6 +1623,8 @@ def export_csv(cid):
     rows = []
     for user in contest["participants"]:
         r = results.get(user)
+        if r and (r.get("bytes") or 0) < MIN_BYTES:
+            continue  # нижче мінімального порогу
         a = assess.get(user, {})
         quality, n = article_quality(a, legacy.get(user))
         sp = split_stats(r)
