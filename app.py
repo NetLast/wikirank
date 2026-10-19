@@ -14,6 +14,7 @@ import io
 import json
 import operator
 import os
+import random
 import re
 import sqlite3
 import time
@@ -73,11 +74,23 @@ CREATE TABLE IF NOT EXISTS article_scores(
 CREATE TABLE IF NOT EXISTS article_comments(
   id INTEGER PRIMARY KEY AUTOINCREMENT, contest_id TEXT, participant TEXT, article TEXT,
   jury_name TEXT, text TEXT, date TEXT);
+CREATE TABLE IF NOT EXISTS article_reviews(
+  contest_id TEXT, participant TEXT, article TEXT, jury TEXT,
+  PRIMARY KEY(contest_id, participant, article, jury));
+CREATE TABLE IF NOT EXISTS article_assignments(
+  contest_id TEXT, participant TEXT, article TEXT, jury TEXT,
+  PRIMARY KEY(contest_id, participant, article, jury));
 """
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
+    had_reviews = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='article_reviews'").fetchone()
     con.executescript(SCHEMA)
+    if not had_reviews:
+        # раніше «перевірено» = є оцінка; переносимо це в явні відмітки
+        con.execute("INSERT OR IGNORE INTO article_reviews "
+                    "SELECT contest_id, participant, article, jury FROM article_scores")
     cols = [r[1] for r in con.execute("PRAGMA table_info(contests)")]
     if "tpl_talk_only" not in cols:
         con.execute("ALTER TABLE contests ADD COLUMN tpl_talk_only INTEGER DEFAULT 0")
@@ -95,7 +108,7 @@ _OPS = {ast.Add: operator.add, ast.Sub: operator.sub,
         ast.Mult: operator.mul, ast.Div: operator.truediv,
         ast.USub: operator.neg, ast.UAdd: operator.pos,
         ast.Pow: operator.pow}
-FORMULA_VARS = ("bytes", "edits", "articles", "quality")
+FORMULA_VARS = ("bytes", "edits", "articles", "quality", "created", "expanded")
 
 def eval_formula(expr, variables):
     def _ev(node):
@@ -239,6 +252,66 @@ T = {
    footer="Wkład ilościowy = suma dodanych bajtów przez API MediaWiki."),
 }
 
+# ── Додаткові рядки інтерфейсу (статуси перевірки, розподіл, нові/доповнені) ──
+_EXTRA = {
+ "uk": dict(
+   th_split="Нові / доповн.", th_split_b="Байти: нові / доповнені",
+   reviewed="Перевірено", unreviewed="Не перевірено",
+   mark_rev="Позначити перевіреною", unmark_rev="Зняти позначку", rev_next="Перевірено → далі",
+   prev="Назад", next="Далі",
+   tab_preview="Превʼю", tab_article="Стаття", tab_history="Історія",
+   open_new="Відкрити в новій вкладці ↗",
+   iframe_hint="Якщо вікі не показується у вікні — відкрийте статтю в новій вкладці.",
+   filter_todo="Не перевірені", filter_done="Перевірені", filter_mine="Призначені мені",
+   mine="мої", assigned_to="Призначено",
+   distribute="Розподілити між журі",
+   distribute_h="Рівномірно розподіляє статті між членами журі; уже призначені статті зберігаються.",
+   per_article="Журі на статтю", reset_dist="Перерозподілити з нуля",
+   dist_done="Розподілено статей", load_title="Розподіл і прогрес журі",
+   th_jury="Журі", th_assigned="Призначено", th_reviewed="Перевірено",
+   th_progress="Перевірено мною", my_assigned="мої призначені",
+   no_jury="Немає облікових записів журі.", no_results="Спершу запустіть «Перевірити внесок».",
+   formula_h="Змінні: bytes (байти), edits (редагування), articles (сторінки), quality (сер. оцінка журі), created (нові статті), expanded (доповнені статті)"),
+ "en": dict(
+   th_split="New / expanded", th_split_b="Bytes: new / expanded",
+   reviewed="Reviewed", unreviewed="Not reviewed",
+   mark_rev="Mark as reviewed", unmark_rev="Remove mark", rev_next="Reviewed → next",
+   prev="Back", next="Next",
+   tab_preview="Preview", tab_article="Article", tab_history="History",
+   open_new="Open in a new tab ↗",
+   iframe_hint="If the wiki does not load in the frame, open the article in a new tab.",
+   filter_todo="Not reviewed", filter_done="Reviewed", filter_mine="Assigned to me",
+   mine="mine", assigned_to="Assigned to",
+   distribute="Distribute among jury",
+   distribute_h="Distributes articles evenly among jury members; existing assignments are kept.",
+   per_article="Jurors per article", reset_dist="Redistribute from scratch",
+   dist_done="Articles distributed", load_title="Jury distribution and progress",
+   th_jury="Jury", th_assigned="Assigned", th_reviewed="Reviewed",
+   th_progress="Reviewed by me", my_assigned="my assigned",
+   no_jury="There are no jury accounts.", no_results="Run “Check contributions” first.",
+   formula_h="Variables: bytes, edits, articles, quality (avg jury score), created (new articles), expanded (expanded articles)"),
+ "pl": dict(
+   th_split="Nowe / rozbud.", th_split_b="Bajty: nowe / rozbudowane",
+   reviewed="Sprawdzono", unreviewed="Niesprawdzone",
+   mark_rev="Oznacz jako sprawdzone", unmark_rev="Usuń oznaczenie", rev_next="Sprawdzone → dalej",
+   prev="Wstecz", next="Dalej",
+   tab_preview="Podgląd", tab_article="Artykuł", tab_history="Historia",
+   open_new="Otwórz w nowej karcie ↗",
+   iframe_hint="Jeśli wiki nie wczytuje się w oknie, otwórz artykuł w nowej karcie.",
+   filter_todo="Niesprawdzone", filter_done="Sprawdzone", filter_mine="Przydzielone mnie",
+   mine="moje", assigned_to="Przydzielono",
+   distribute="Rozdziel między jury",
+   distribute_h="Równomiernie rozdziela artykuły między członków jury; istniejące przydziały są zachowane.",
+   per_article="Jurorów na artykuł", reset_dist="Rozdziel od nowa",
+   dist_done="Rozdzielono artykułów", load_title="Podział i postęp jury",
+   th_jury="Jury", th_assigned="Przydzielono", th_reviewed="Sprawdzono",
+   th_progress="Sprawdzone przeze mnie", my_assigned="moje przydzielone",
+   no_jury="Brak kont jury.", no_results="Najpierw uruchom „Sprawdź wkład”.",
+   formula_h="Zmienne: bytes (bajty), edits (edycje), articles (strony), quality (śr. ocena jury), created (nowe artykuły), expanded (rozbudowane artykuły)"),
+}
+for _l, _d in _EXTRA.items():
+    T[_l].update(_d)
+
 def lang():
     l = request.args.get("lang") or session.get("lang") or "uk"
     if l not in T:
@@ -317,6 +390,18 @@ justify-content:center;color:var(--mut);font-size:11px}
 color:#fff;display:flex;align-items:center;justify-content:center;z-index:5;
 box-shadow:0 2px 6px rgba(0,0,0,.35);font-size:16px;line-height:1}
 .car-nav.prev{left:-8px}.car-nav.next{right:-8px}
+.st-ok{background:#e6f4ea;color:#1d7a4f}.st-todo{background:#fdf0dc;color:#9a5b00}
+.md-back{position:fixed;inset:0;background:rgba(16,24,32,.6);z-index:1000;display:flex;align-items:center;justify-content:center;padding:12px}
+.md-box{background:#fff;border-radius:14px;width:100%;max-width:1360px;height:94vh;display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,1fr);overflow:hidden}
+.md-left{display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--line)}
+.md-right{padding:16px 18px;overflow:auto}
+.md-tabs{display:flex;gap:6px;padding:10px 12px;border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap}
+.md-tabs button{background:#fff;border:1px solid var(--line);color:var(--ink2);padding:5px 12px}
+.md-tabs button.on{background:var(--grad-dark);color:#fff;font-weight:600}
+.md-pane{flex:1;overflow:auto;padding:16px 18px}
+.md-frame{flex:1;width:100%;border:0;min-height:0}
+.md-top{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+@media(max-width:820px){.md-box{grid-template-columns:1fr;overflow:auto;height:96vh}.md-left{height:62vh}}
 """
 
 LOGIN_HTML = """<!doctype html><html lang="{{l}}"><meta charset="utf-8">
@@ -442,7 +527,7 @@ async function pageRevisionsWithDiff(api,title){
  let cont=null,all=[],g=0;
  do{
   const params={action:'query',prop:'revisions',titles:title,
-   rvprop:'user|timestamp|size|flags',rvlimit:'500',rvdir:'older'};
+   rvprop:'user|timestamp|size|flags|ids',rvlimit:'500',rvdir:'older'};
   if(cont)params.rvcontinue=cont;
   const d=await mw(api,params);
   const page=Object.values(d.query?.pages||{})[0];
@@ -543,7 +628,7 @@ async function runCheck(){
       pp._titles.add(tplPages[i]);row._titles.add(pr.host+'::'+tplPages[i]);
       if(!pp._detail[tplPages[i]])pp._detail[tplPages[i]]={bytes:0,created:false};
       if(r.diff>0)pp._detail[tplPages[i]].bytes+=r.diff;
-      if('new' in r)pp._detail[tplPages[i]].created=true;
+      if('new' in r||r.parentid===0)pp._detail[tplPages[i]].created=true;
      });
     }catch(e){/* сторінку могли видалити/перейменувати — пропускаємо */}
     if(i%5===4)await sleep(150);
@@ -598,10 +683,58 @@ async function saveComment(user,article){
 }
 let ARTOPEN=null;
 let ART_FILTER='all'; // 'all' | 'created' | 'expanded'
-function setArtFilter(f){ART_FILTER=f;render()}
+let REV_FILTER='all'; // 'all' | 'todo' | 'done' | 'mine'
+let CUR_LIST=[];      // поточний відфільтрований список статей відкритого учасника
+let SCROLL_RESET=false;
+let MTAB='article';   // 'preview' | 'article' | 'history'
+const JURY_LIST={{juryjson|safe}};
+function setArtFilter(f){ART_FILTER=f;SCROLL_RESET=true;render()}
+function setRevFilter(f){REV_FILTER=f;SCROLL_RESET=true;render()}
 function articleLink(origin,title){return origin+'/wiki/'+encodeURIComponent(title.replace(/ /g,'_'))}
+function slot(user,title){const a=ASSESS[user]&&ASSESS[user][title];return a||{scores:{},comments:[],reviewed:[],assigned:[]}}
+function isReviewed(user,title){return (slot(user,title).reviewed||[]).indexOf(JURY_LOGIN)>=0}
+function isMine(user,title){return (slot(user,title).assigned||[]).indexOf(JURY_LOGIN)>=0}
+function juryName(login){const j=JURY_LIST.find(x=>x.login===login);return j?j.name:login}
+async function reloadState(){const r=await fetch('/api/state/'+CID);ASSESS=(await r.json()).assess}
+async function setReviewed(user,title,val){
+ await fetch('/api/review',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({contest:CID,participant:user,article:title,reviewed:!!val})});
+ await reloadState();render();
+}
+async function runDistribute(){
+ const reset=document.getElementById('distReset').checked;
+ const per=Number(document.getElementById('distPer').value)||1;
+ const msg=document.getElementById('distmsg');
+ msg.textContent=T.loading;
+ try{
+  const r=await fetch('/api/distribute/'+CID,{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({per_article:per,reset:reset})});
+  const d=await r.json();
+  if(!r.ok||d.error){msg.textContent='✗ '+(T[d.error]||d.error||r.status);return}
+  await reloadState();render();
+  msg.textContent='✓ '+T.dist_done+': '+d.items;
+ }catch(e){msg.textContent='✗ '+e.message}
+}
+function renderLoad(){
+ const box=document.getElementById('loadbox');if(!box)return;
+ box.style.display=QUAL?'block':'none';if(!QUAL)return;
+ const st={};
+ JURY_LIST.forEach(j=>{if(j.role==='jury')st[j.login]={a:0,r:0}});
+ Object.values(ASSESS).forEach(pa=>Object.values(pa).forEach(a=>{
+  (a.assigned||[]).forEach(l=>{if(!st[l])st[l]={a:0,r:0};st[l].a++;if((a.reviewed||[]).indexOf(l)>=0)st[l].r++})}));
+ const logins=Object.keys(st);
+ let h;
+ if(!logins.length)h='<div class="hint">'+T.no_jury+'</div>';
+ else{
+  h='<table><thead><tr><th>'+T.th_jury+'</th><th>'+T.th_assigned+'</th><th>'+T.th_reviewed+'</th><th style="width:35%"></th></tr></thead><tbody>';
+  logins.forEach(l=>{const s=st[l];const pct=s.a?Math.round(s.r/s.a*100):0;
+   h+='<tr><td><b>'+esc(juryName(l))+'</b></td><td class="mono">'+s.a+'</td><td class="mono">'+s.r+' ('+pct+'%)</td><td><div class="pbar"><i style="width:'+pct+'%"></i></div></td></tr>'});
+  h+='</tbody></table>';
+ }
+ document.getElementById('loadtbl').innerHTML=h;
+}
 
-// ── Модальне прев'ю статті: превʼю зліва, оцінка/коментарі справа ──
+// ── Модальне вікно: стаття (iframe) / превʼю / історія зліва, оцінка та коментарі справа ──
 let MODAL=null; // {user,title,origin,host,api,label,bytes,created}
 const EXTRACT_CACHE={};
 const THUMB_PENDING=new Set();
@@ -623,64 +756,128 @@ async function prefetchThumbs(api,host,titles){
  }
  THUMB_PENDING.delete(host);
 }
-async function openArticle(user,title,origin,host,api,label,bytes,created){
- MODAL={user,title,origin,host,api,label,bytes,created};
+function openIdx(i){const it=CUR_LIST[i];if(it)openItem(it)}
+function modalIdx(){
+ if(!MODAL)return -1;
+ return CUR_LIST.findIndex(x=>x.user===MODAL.user&&x.title===MODAL.title&&x.host===MODAL.host);
+}
+function stepModal(d){const i=modalIdx();const n=i>=0?CUR_LIST[i+d]:null;if(n)openItem(n)}
+async function reviewAndNext(){
+ if(!MODAL)return;
+ const i=modalIdx();const nxt=i>=0?CUR_LIST[i+1]:null;const m=MODAL;
+ if(!isReviewed(m.user,m.title))await setReviewed(m.user,m.title,true);
+ if(nxt)openItem(nxt);else closeModal();
+}
+function toggleReviewed(){if(MODAL)setReviewed(MODAL.user,MODAL.title,!isReviewed(MODAL.user,MODAL.title))}
+function saveScoreM(v){if(MODAL)saveScore(MODAL.user,MODAL.title,v)}
+async function saveCommentM(){
+ const inp=document.querySelector('.md-cm');if(!inp||!MODAL)return;
+ const text=inp.value.trim();if(!text)return;
+ inp.value='';
+ await fetch('/api/comment',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({contest:CID,participant:MODAL.user,article:MODAL.title,text})});
+ await reloadState();render();
+}
+function setTab(k){MTAB=k;renderModal()}
+async function openItem(it){
+ MODAL={user:it.user,title:it.title,origin:it.origin,host:it.host,api:it.api,label:it.label,bytes:it.bytes,created:it.created};
  renderModal();
- const key=host+'::'+title;
+ const key=it.host+'::'+it.title;
  const cached=EXTRACT_CACHE[key];
  if(!cached||cached.extract==null){
   try{
-   const d=await mw(api,{action:'query',prop:'extracts|pageimages',exintro:'1',explaintext:'1',
-    exchars:'700',piprop:'thumbnail',pithumbsize:'500',redirects:'1',titles:title});
+   const d=await mw(it.api,{action:'query',prop:'extracts|pageimages',exintro:'1',explaintext:'1',
+    exchars:'700',piprop:'thumbnail',pithumbsize:'500',redirects:'1',titles:it.title});
    const page=Object.values(d.query?.pages||{})[0];
    EXTRACT_CACHE[key]={extract:page?.extract||'',thumb:page?.thumbnail?.source||(cached&&cached.thumb)||null};
   }catch(e){EXTRACT_CACHE[key]={extract:'',thumb:(cached&&cached.thumb)||null,err:String(e.message||e)}}
-  if(MODAL&&MODAL.title===title&&MODAL.host===host)renderModal();
+  if(MODAL&&MODAL.title===it.title&&MODAL.host===it.host)renderModal();
  }
 }
 function closeModal(){MODAL=null;renderModal()}
-function renderModal(){
- let el=document.getElementById('artModal');
- if(!MODAL){if(el)el.remove();return}
- if(!el){el=document.createElement('div');el.id='artModal';document.body.appendChild(el)}
- const key=MODAL.host+'::'+MODAL.title;
- const ex=EXTRACT_CACHE[key];
- const ad=(ASSESS[MODAL.user]&&ASSESS[MODAL.user][MODAL.title])||{scores:{},comments:[]};
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&MODAL)closeModal()});
+function leftHtml(ex){
+ const m=MODAL;
+ let h='<div class="md-tabs">';
+ [['article',T.tab_article],['history',T.tab_history],['preview',T.tab_preview]].forEach(x=>{
+  h+='<button data-tab="'+x[0]+'" class="'+(MTAB===x[0]?'on':'')+'">'+esc(x[1])+'</button>'});
+ h+='<a class="hint" style="margin-left:auto" target="_blank" rel="noopener" title="'+esc(T.iframe_hint)+'" href="'+esc(articleLink(m.origin,m.title))+'">'+T.open_new+'</a></div>';
+ if(MTAB==='preview'){
+  h+='<div class="md-pane">';
+  if(!ex||ex.extract==null)h+='<div class="hint">'+T.loading+'</div>';
+  else if(ex.err)h+='<div class="hint">'+esc(ex.err)+'</div>';
+  else{
+   if(ex.thumb)h+='<img src="'+esc(ex.thumb)+'" alt="" style="max-width:100%;border-radius:8px;margin-bottom:10px;display:block">';
+   h+='<h3 style="margin:0 0 8px">'+esc(m.title)+'</h3>';
+   h+='<div style="font-size:14px;line-height:1.55;white-space:pre-wrap">'+esc(ex.extract||'')+'</div>';
+  }
+  h+='</div>';
+ }else{
+  const enc=encodeURIComponent(m.title.replace(/ /g,'_'));
+  const src=MTAB==='history'?m.origin+'/w/index.php?title='+enc+'&action=history':articleLink(m.origin,m.title)+'?useskin=minerva';
+  h+='<iframe class="md-frame" src="'+esc(src)+'" sandbox="allow-same-origin allow-scripts allow-popups allow-popups-to-escape-sandbox"></iframe>';
+ }
+ return h;
+}
+function rightHtml(){
+ const m=MODAL;
+ const ad=slot(m.user,m.title);
  const vals=Object.values(ad.scores||{}).filter(v=>v!=null);
  const avg=vals.length?(vals.reduce((x,y)=>x+y,0)/vals.length):null;
  const my=(ad.scores||{})[JURY_LOGIN];
- const cid=idFor(MODAL.user+'||'+MODAL.title);
- let h='<div style="position:fixed;inset:0;background:rgba(16,24,32,.6);z-index:1000;display:flex;align-items:center;justify-content:center;padding:16px" onclick="if(event.target===this)closeModal()">';
- h+='<div style="background:#fff;border-radius:14px;max-width:920px;width:100%;max-height:92vh;overflow:auto;display:grid;grid-template-columns:1fr 1fr" onclick="event.stopPropagation()">';
- h+='<div style="padding:22px;border-right:1px solid var(--line)">';
- if(!ex||ex.extract==null)h+='<div class="hint">'+T.loading+'</div>';
- else if(ex.err)h+='<div class="hint">'+esc(ex.err)+'</div>';
- else{
-  if(ex.thumb)h+='<img src="'+esc(ex.thumb)+'" alt="" style="max-width:100%;border-radius:8px;margin-bottom:10px;display:block">';
-  h+='<h3 style="margin:0 0 8px">'+esc(MODAL.title)+'</h3>';
-  h+='<div style="font-size:14px;line-height:1.55;white-space:pre-wrap">'+esc(ex.extract||'')+'</div>';
- }
- h+='<a class="btn-p" style="display:inline-block;margin-top:14px;text-decoration:none" target="_blank" rel="noopener" href="'+articleLink(MODAL.origin,MODAL.title)+'">'+T.open_article+' ↗</a>';
- h+='</div>';
- h+='<div style="padding:22px">';
- h+='<button class="btn-s" style="float:right;padding:4px 10px" onclick="closeModal()">✕</button>';
+ const rev=isReviewed(m.user,m.title);
+ const idx=modalIdx();
+ const cid=idFor(m.user+'||'+m.title);
+ let h='<div class="md-top">';
+ h+='<button class="btn-s" onclick="stepModal(-1)"'+(idx>0?'':' disabled')+'>‹ '+T.prev+'</button>';
+ h+='<button class="btn-s" onclick="stepModal(1)"'+(idx>=0&&idx<CUR_LIST.length-1?'':' disabled')+'>'+T.next+' ›</button>';
+ h+='<span class="hint mono">'+(idx>=0?(idx+1)+' / '+CUR_LIST.length:'')+'</span>';
+ h+='<button class="btn-s" style="margin-left:auto;padding:4px 10px" onclick="closeModal()">✕</button></div>';
+ h+='<h3 style="margin:4px 0 6px">'+esc(m.title)+'</h3>';
  h+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">';
- h+='<span class="chip" style="background:'+(MODAL.created?'#e6f4ea':'var(--acc-soft)')+';color:'+(MODAL.created?'#1d7a4f':'var(--acc)')+'">'+(MODAL.created?T.created:T.expanded)+'</span>';
- h+='<span class="hint mono">'+esc(MODAL.label)+' · +'+fmtN(MODAL.bytes)+(LANG==='uk'?' Б':' B')+'</span>';
- h+='</div>';
- h+='<div class="hint" style="margin:8px 0 4px">'+esc(MODAL.user)+'</div>';
- h+='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px">';
+ h+='<span class="chip" style="background:'+(m.created?'#e6f4ea':'var(--acc-soft)')+';color:'+(m.created?'#1d7a4f':'var(--acc)')+'">'+(m.created?T.created:T.expanded)+'</span>';
+ h+='<span class="chip '+(rev?'st-ok':'st-todo')+'">'+(rev?'✓ '+T.reviewed:'● '+T.unreviewed)+'</span>';
+ h+='<span class="hint mono">'+esc(m.label)+' · +'+fmtN(m.bytes)+(LANG==='uk'?' Б':' B')+'</span></div>';
+ h+='<div class="hint">'+esc(m.user)+'</div>';
+ if((ad.assigned||[]).length)h+='<div class="hint" style="margin-top:4px">'+T.assigned_to+': '+ad.assigned.map(l=>esc(juryName(l))).join(', ')+'</div>';
+ h+='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px">';
  h+='<label class="hint" style="font-size:12px">'+T.th_my+':</label>';
- h+='<input type="number" step="0.1" style="width:70px" value="'+(my??'')+'" onchange="saveScore('+esc(JSON.stringify(MODAL.user))+','+esc(JSON.stringify(MODAL.title))+',this.value)">';
- h+='<span class="hint mono">'+T.th_avg+': '+(avg!=null?avg.toFixed(2):'—')+(vals.length?' ('+vals.length+' '+T.scores_n+')':'')+'</span>';
- h+='</div>';
+ h+='<input type="number" step="0.1" style="width:70px" value="'+(my??'')+'" onchange="saveScoreM(this.value)">';
+ h+='<span class="hint mono">'+T.th_avg+': '+(avg!=null?avg.toFixed(2):'—')+(vals.length?' ('+vals.length+' '+T.scores_n+')':'')+'</span></div>';
+ h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">';
+ h+='<button class="btn-p" onclick="reviewAndNext()">'+(rev?T.next+' ›':T.rev_next)+'</button>';
+ h+='<button class="btn-s" onclick="toggleReviewed()">'+(rev?T.unmark_rev:T.mark_rev)+'</button></div>';
  h+='<div style="margin-top:14px">';
  (ad.comments||[]).forEach(c=>{h+='<div style="padding:5px 0;border-bottom:1px dashed var(--line)"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span><div>'+esc(c.text)+'</div></div>'});
  if(!(ad.comments||[]).length)h+='<div class="hint" style="font-size:12px">'+T.no_comments+'</div>';
- h+='<div style="display:flex;gap:8px;margin-top:8px"><input id="cm_'+cid+'" placeholder="'+T.comment_ph+'" onkeydown="if(event.key===\\'Enter\\')saveComment('+esc(JSON.stringify(MODAL.user))+','+esc(JSON.stringify(MODAL.title))+')"><button class="btn-p" onclick="saveComment('+esc(JSON.stringify(MODAL.user))+','+esc(JSON.stringify(MODAL.title))+')">'+T.save+'</button></div>';
+ h+='<div style="display:flex;gap:8px;margin-top:8px"><input class="md-cm" id="cm_'+cid+'" placeholder="'+esc(T.comment_ph)+'" onkeydown="if(event.keyCode===13)saveCommentM()"><button class="btn-p" onclick="saveCommentM()">'+T.save+'</button></div>';
  h+='</div>';
- h+='</div></div></div>';
- el.innerHTML=h;
+ return h;
+}
+function renderModal(){
+ let el=document.getElementById('artModal');
+ if(!MODAL){if(el)el.remove();return}
+ if(!el){
+  el=document.createElement('div');el.id='artModal';
+  el.innerHTML='<div class="md-back" onclick="if(event.target===this)closeModal()"><div class="md-box"><div class="md-left" id="mdLeft"></div><div class="md-right" id="mdRight"></div></div></div>';
+  document.body.appendChild(el);
+ }
+ const key=MODAL.host+'::'+MODAL.title;
+ const ex=EXTRACT_CACHE[key];
+ // ліва частина перебудовується лише при зміні статті/вкладки — щоб iframe не перезавантажувався
+ const left=document.getElementById('mdLeft');
+ const lk=key+'|'+MTAB+'|'+(MTAB==='preview'?(ex&&ex.extract!=null?'1':'0'):'');
+ if(left.dataset.k!==lk){
+  left.dataset.k=lk;left.innerHTML=leftHtml(ex);
+  left.querySelectorAll('[data-tab]').forEach(b=>{b.onclick=()=>setTab(b.dataset.tab)});
+ }
+ const rt=document.getElementById('mdRight');
+ const old=rt.querySelector('.md-cm');
+ const draft=old?old.value:'';const hadFocus=!!old&&document.activeElement===old;
+ const same=rt.dataset.k===key;
+ rt.innerHTML=rightHtml();rt.dataset.k=key;
+ const nw=rt.querySelector('.md-cm');
+ if(nw&&same){nw.value=draft;if(hadFocus)nw.focus()}
 }
 function articleQuality(pa){
  if(!pa)return{quality:0,n:0};
@@ -692,28 +889,52 @@ function articleQuality(pa){
  return{quality:avgs.length?avgs.reduce((x,y)=>x+y,0)/avgs.length:0,n};
 }
 function evalFormula(f,v){
- const cleaned=f.replace(/\\b(bytes|edits|articles|quality)\\b/g,'1');
+ const cleaned=f.replace(/\\b(bytes|edits|articles|quality|created|expanded)\\b/g,'1');
  if(!/^[\\d\\s+\\-*/().,]+$/.test(cleaned))return null;
- try{const fn=new Function('bytes','edits','articles','quality','return ('+f+')');
-  const r=fn(v.bytes,v.edits,v.articles,v.quality);
+ try{const fn=new Function('bytes','edits','articles','quality','created','expanded','return ('+f+')');
+  const r=fn(v.bytes,v.edits,v.articles,v.quality,v.created||0,v.expanded||0);
   return typeof r==='number'&&!isNaN(r)?r:null}catch(e){return null}
+}
+// розбивка внеску на нові та доповнені статті (з уже збережених списків)
+function splitStats(r){
+ const s={created:0,expanded:0,bc:0,be:0};
+ if(!r)return s;
+ Object.values(r.perProject||{}).forEach(pp=>(pp.list||[]).forEach(it=>{
+  if(it.created){s.created++;s.bc+=it.bytes}else{s.expanded++;s.be+=it.bytes}}));
+ return s;
+}
+function partTitles(r){
+ const s=new Set();
+ if(r)Object.values(r.perProject||{}).forEach(pp=>(pp.list||[]).forEach(it=>s.add(it.title)));
+ return[...s];
 }
 function fmtN(n){return n==null?'—':n.toLocaleString(LANG==='uk'?'uk-UA':'en-GB')}
 function idFor(u){return btoa(unescape(encodeURIComponent(u))).replace(/[^a-z0-9]/gi,'')}
 function contribLink(origin,user){return origin+'/wiki/Special:Contributions/'+encodeURIComponent(user)}
 
+let ROWS_CUR=[];
+function toggleArt(i){const u=ROWS_CUR[i].user;ARTOPEN=ARTOPEN===u?null:u;SCROLL_RESET=true;render()}
 function render(){
  const el=document.getElementById('tbl');if(!CONTEST){el.innerHTML='';return}
+ const oldCar=el.querySelector('.carousel');
+ const keepScroll=(oldCar&&!SCROLL_RESET)?oldCar.scrollLeft:0;SCROLL_RESET=false;
+ CUR_LIST=[];
  const rows=CONTEST.participants.map(user=>{
   const r=RESULTS?RESULTS[user]:null;const pa=ASSESS[user]||{};
   const{quality,n}=articleQuality(pa);
-  const score=r?evalFormula(CONTEST.formula,{bytes:r.bytes,edits:r.edits,articles:r.articles,quality}):null;
-  return{user,r,pa,quality,n,score};
+  const sp=splitStats(r);
+  const score=r?evalFormula(CONTEST.formula,{bytes:r.bytes,edits:r.edits,articles:r.articles,quality,created:sp.created,expanded:sp.expanded}):null;
+  const titles=partTitles(r);
+  const done=titles.filter(t=>isReviewed(user,t)).length;
+  const mineT=titles.filter(t=>isMine(user,t));
+  const mineDone=mineT.filter(t=>isReviewed(user,t)).length;
+  return{user,r,pa,quality,n,score,sp,total:titles.length,done,mine:mineT.length,mineDone};
  }).sort((x,y)=>QUAL?((y.score??-1e18)-(x.score??-1e18)):((y.r?y.r.bytes:-1)-(x.r?x.r.bytes:-1)));
+ ROWS_CUR=rows;
  const maxB=Math.max(1,...rows.map(r=>r.r?r.r.bytes:0));
  let h='<table><thead><tr><th>#</th><th>'+T.th_u+'</th>';
- if(QUANT){h+='<th>'+T.th_b+'</th>';projects.forEach(p=>h+='<th>'+esc(p.label)+'</th>');h+='<th>'+T.th_e+'</th>'}
- if(QUAL)h+='<th>'+T.th_avg+'</th><th>'+T.th_score+'</th>';
+ if(QUANT){h+='<th>'+T.th_b+'</th>';projects.forEach(p=>h+='<th>'+esc(p.label)+'</th>');h+='<th>'+T.th_e+'</th><th>'+T.th_split+'</th>'}
+ if(QUAL)h+='<th>'+T.th_avg+'</th><th>'+T.th_score+'</th><th>'+T.th_progress+'</th>';
  h+='<th></th></tr></thead><tbody>';
  if(!rows.length)h+='<tr><td colspan="99" class="hint" style="padding:20px">'+T.no_parts+'</td></tr>';
  rows.forEach((row,i)=>{
@@ -726,54 +947,86 @@ function render(){
    projects.forEach(p=>{const pp=row.r?row.r.perProject[p.host]:null;
     h+='<td class="mono" style="font-size:12px">'+(pp?(pp.err?'<span style="color:var(--err)" title="'+esc(pp.err)+'">'+T.err+'</span>':'+'+fmtN(pp.bytes)):'—')+'</td>'});
    h+='<td class="mono" style="font-size:12px">'+(row.r?fmtN(row.r.edits)+' / '+fmtN(row.r.articles):'—')+'</td>';
+   h+='<td class="mono" style="font-size:12px">'+(row.r?'<span style="color:#1d7a4f">'+fmtN(row.sp.created)+'</span> / '+fmtN(row.sp.expanded)
+    +'<div class="hint">+'+fmtN(row.sp.bc)+' / +'+fmtN(row.sp.be)+'</div>':'—')+'</td>';
   }
   if(QUAL){
    h+='<td class="mono">'+(row.n?row.quality.toFixed(2):'—')+'<div class="hint">'+row.n+' '+T.scores_n+'</div></td>';
    h+='<td><span class="mono" style="font-weight:700;color:var(--gold);font-size:15px">'+(row.score!=null?row.score.toFixed(2):'—')+'</span></td>';
+   h+='<td class="mono" style="font-size:12px">'+(row.total?row.done+' / '+row.total:'—')
+    +(row.mine?'<div class="hint">'+T.my_assigned+': '+row.mineDone+' / '+row.mine+'</div>':'')+'</td>';
   }
-  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="ARTOPEN=ARTOPEN==='+esc(JSON.stringify(row.user))+'?null:'+esc(JSON.stringify(row.user))+';render()">'+T.articles_btn+(row.r?' ('+row.r.articles+')':'')+'</button>':'')+'</td></tr>';
+  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="toggleArt('+i+')">'+T.articles_btn+(row.r?' ('+row.r.articles+')':'')+'</button>':'')+'</td></tr>';
   if(QUAL&&ARTOPEN===row.user){
-   h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:900px">';
+   h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:1000px">';
    const items=[];
    projects.forEach(p=>{const pp=row.r?row.r.perProject[p.host]:null;
     (pp&&pp.list?pp.list:[]).forEach(it=>items.push({...it,origin:p.origin,label:p.label,host:p.host,api:p.api}))});
-   items.sort((a,b2)=>b2.bytes-a.bytes);
+   // спершу неперевірені мною, серед них — призначені мені, далі за приростом байтів
+   items.sort((a,b2)=>{
+    const ra=isReviewed(row.user,a.title)?1:0,rb=isReviewed(row.user,b2.title)?1:0;
+    if(ra!==rb)return ra-rb;
+    const ma=isMine(row.user,a.title)?1:0,mb=isMine(row.user,b2.title)?1:0;
+    if(ma!==mb)return mb-ma;
+    return b2.bytes-a.bytes;
+   });
    if(!items.length)h+='<div class="hint">'+T.no_articles+'</div>';
    else{
-    if(items[0])prefetchThumbs(items[0].api,items[0].host,items.map(i=>i.title));
-    // кнопки фільтрів
-    h+='<div style="display:flex;gap:6px;margin-bottom:8px">';
-    [['all',T.filter_all],['created',T.filter_created],['expanded',T.filter_expanded]].forEach(([f,lbl])=>{
-     h+='<button class="btn-s art-filt-btn" data-f="'+f+'" style="padding:3px 10px;font-size:12px'+(ART_FILTER===f?';background:var(--grad-dark);color:#fff':'')+'">'+ esc(lbl)+'</button>';
-    });
+    const byHost={};
+    items.forEach(it=>{(byHost[it.host]=byHost[it.host]||{api:it.api,t:[]}).t.push(it.title)});
+    Object.keys(byHost).forEach(hh=>prefetchThumbs(byHost[hh].api,hh,byHost[hh].t));
+    const nC=items.filter(it=>it.created).length,nE=items.length-nC;
+    const nDone=items.filter(it=>isReviewed(row.user,it.title)).length;
+    const nMine=items.filter(it=>isMine(row.user,it.title)).length;
+    const btn=(cls,f,cur,lbl)=>'<button class="btn-s '+cls+'" data-f="'+f+'" style="padding:3px 10px;font-size:12px'+(cur===f?';background:var(--grad-dark);color:#fff':'')+'">'+esc(lbl)+'</button>';
+    h+='<div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">';
+    h+=btn('art-filt-btn','all',ART_FILTER,T.filter_all+' ('+items.length+')');
+    h+=btn('art-filt-btn','created',ART_FILTER,T.filter_created+' ('+nC+')');
+    h+=btn('art-filt-btn','expanded',ART_FILTER,T.filter_expanded+' ('+nE+')');
+    h+='</div><div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">';
+    h+=btn('rev-filt-btn','all',REV_FILTER,T.filter_all);
+    h+=btn('rev-filt-btn','todo',REV_FILTER,T.filter_todo+' ('+(items.length-nDone)+')');
+    h+=btn('rev-filt-btn','done',REV_FILTER,T.filter_done+' ('+nDone+')');
+    h+=btn('rev-filt-btn','mine',REV_FILTER,T.filter_mine+' ('+nMine+')');
     h+='</div>';
-    // фільтруємо
-    const filtered=ART_FILTER==='all'?items:items.filter(it=>ART_FILTER==='created'?it.created:!it.created);
+    const filtered=items.filter(it=>{
+     if(ART_FILTER==='created'&&!it.created)return false;
+     if(ART_FILTER==='expanded'&&it.created)return false;
+     const rv=isReviewed(row.user,it.title);
+     if(REV_FILTER==='todo'&&rv)return false;
+     if(REV_FILTER==='done'&&!rv)return false;
+     if(REV_FILTER==='mine'&&!isMine(row.user,it.title))return false;
+     return true;
+    });
+    CUR_LIST=filtered.map(it=>({...it,user:row.user}));
     if(!filtered.length)h+='<div class="hint">'+T.no_articles+'</div>';
     else{
-    h+='<div class="carousel-wrap">';
-    h+='<button class="car-nav prev" onclick="this.nextElementSibling.scrollBy({left:-320,behavior:\\'smooth\\'})">‹</button>';
-    h+='<div class="carousel">';
-    filtered.forEach(it=>{
-     const ad=(row.pa&&row.pa[it.title])||{scores:{},comments:[]};
-     const vals=Object.values(ad.scores||{}).filter(v=>v!=null);
-     const avg=vals.length?(vals.reduce((x,y)=>x+y,0)/vals.length):null;
-     const nCm=(ad.comments||[]).length;
-     const ex=EXTRACT_CACHE[it.host+'::'+it.title];
-     const thumbHtml=ex&&ex.thumb?'<img class="thumb" src="'+esc(ex.thumb)+'" alt="">':'<div class="thumb-ph">'+(ex?'—':'…')+'</div>';
-     h+='<div class="art-card" onclick="openArticle('+esc(JSON.stringify(row.user))+','+esc(JSON.stringify(it.title))+','+esc(JSON.stringify(it.origin))+','+esc(JSON.stringify(it.host))+','+esc(JSON.stringify(it.api))+','+esc(JSON.stringify(it.label))+','+it.bytes+','+(it.created?'true':'false')+')">';
-     h+=thumbHtml;
-     h+='<div class="body"><div class="art-title">'+esc(it.title)+'</div>';
-     h+='<div class="hint" style="font-size:10px;margin-top:4px">'+it.label+' · +'+fmtN(it.bytes)+(LANG==='uk'?' Б':' B')+'</div>';
-     h+='<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:5px">';
-     h+='<span class="chip" style="font-size:10px;background:'+(it.created?'#e6f4ea':'var(--acc-soft)')+';color:'+(it.created?'#1d7a4f':'var(--acc)')+'">'+(it.created?T.created:T.expanded)+'</span>';
-     if(avg!=null)h+='<span class="chip" style="font-size:10px;background:#fbf3e2;color:#b07a1e">★ '+avg.toFixed(1)+'</span>';
-     if(nCm)h+='<span class="hint" style="font-size:10px">💬'+nCm+'</span>';
-     h+='</div></div></div>';
-    });
-    h+='</div>';
-    h+='<button class="car-nav next" onclick="this.previousElementSibling.scrollBy({left:320,behavior:\\'smooth\\'})">›</button>';
-    h+='</div>';
+     h+='<div class="carousel-wrap">';
+     h+='<button class="car-nav prev" onclick="this.nextElementSibling.scrollBy({left:-320,behavior:\\'smooth\\'})">‹</button>';
+     h+='<div class="carousel">';
+     filtered.forEach((it,k)=>{
+      const ad=slot(row.user,it.title);
+      const vals=Object.values(ad.scores||{}).filter(v=>v!=null);
+      const avg=vals.length?(vals.reduce((x,y)=>x+y,0)/vals.length):null;
+      const nCm=(ad.comments||[]).length;
+      const rv=isReviewed(row.user,it.title),mine=isMine(row.user,it.title);
+      const ex=EXTRACT_CACHE[it.host+'::'+it.title];
+      const thumbHtml=ex&&ex.thumb?'<img class="thumb" src="'+esc(ex.thumb)+'" alt="">':'<div class="thumb-ph">'+(ex?'—':'…')+'</div>';
+      h+='<div class="art-card" style="'+(rv?'opacity:.72':'')+'" onclick="openIdx('+k+')">';
+      h+=thumbHtml;
+      h+='<div class="body"><div class="art-title">'+esc(it.title)+'</div>';
+      h+='<div class="hint" style="font-size:10px;margin-top:4px">'+esc(it.label)+' · +'+fmtN(it.bytes)+(LANG==='uk'?' Б':' B')+'</div>';
+      h+='<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:5px">';
+      h+='<span class="chip" style="font-size:10px;background:'+(it.created?'#e6f4ea':'var(--acc-soft)')+';color:'+(it.created?'#1d7a4f':'var(--acc)')+'">'+(it.created?T.created:T.expanded)+'</span>';
+      h+='<span class="chip '+(rv?'st-ok':'st-todo')+'" style="font-size:10px">'+(rv?'✓ '+T.reviewed:'● '+T.unreviewed)+'</span>';
+      if(mine)h+='<span class="chip tag-a" style="font-size:10px">'+T.mine+'</span>';
+      if(avg!=null)h+='<span class="chip" style="font-size:10px;background:#fbf3e2;color:#b07a1e">★ '+avg.toFixed(1)+'</span>';
+      if(nCm)h+='<span class="hint" style="font-size:10px">💬'+nCm+'</span>';
+      h+='</div></div></div>';
+     });
+     h+='</div>';
+     h+='<button class="car-nav next" onclick="this.previousElementSibling.scrollBy({left:320,behavior:\\'smooth\\'})">›</button>';
+     h+='</div>';
     } // end if filtered.length
    } // end else items.length
    h+='</div></td></tr>';
@@ -781,8 +1034,11 @@ function render(){
  });
  h+='</tbody></table>';
  el.innerHTML=h;
+ const nc=el.querySelector('.carousel');if(nc&&keepScroll)nc.scrollLeft=keepScroll;
  el.querySelectorAll('.art-filt-btn').forEach(b=>{b.onclick=function(){setArtFilter(this.dataset.f)}});
+ el.querySelectorAll('.rev-filt-btn').forEach(b=>{b.onclick=function(){setRevFilter(this.dataset.f)}});
  document.getElementById('csvlink').href='/export/'+CID+'.csv?quant='+(QUANT?1:0)+'&qual='+(QUAL?1:0);
+ renderLoad();
  renderModal();
 }
 window.addEventListener('DOMContentLoaded',render);
@@ -918,6 +1174,20 @@ ANALYSIS_TPL = """
   <div id="runbar" style="margin-top:6px"></div>
  </div>
 </div>
+<div id="loadbox" class="card" style="display:none">
+ <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end">
+  <div><div class="lbl" style="margin:0">{{t.load_title}}</div><div class="hint">{{t.distribute_h}}</div></div>
+  {% if me.role=='admin' %}
+  <div style="margin-left:auto;display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+   <div><label class="lbl" style="margin:0 0 2px">{{t.per_article}}</label><input id="distPer" type="number" min="1" value="1" style="width:70px"></div>
+   <label class="hint" style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><input type="checkbox" id="distReset" style="width:auto"> {{t.reset_dist}}</label>
+   <button class="btn-p" onclick="runDistribute()">{{t.distribute}}</button>
+  </div>
+  {% endif %}
+ </div>
+ <div id="distmsg" class="hint mono" style="margin-top:6px"></div>
+ <div id="loadtbl" style="margin-top:8px"></div>
+</div>
 <div class="card" style="padding:0;overflow-x:auto"><div id="tbl"></div></div>
 <div class="hint">{{t.f_of}} <span class="chip">{{contest.formula}}</span></div>
 {% endif %}
@@ -951,19 +1221,40 @@ def get_contests():
     return out
 
 def get_assess(cid):
-    """Оцінки та коментарі по кожній конкурсній статті окремо.
-    Структура: {учасник: {стаття: {"scores":{журі:бал}, "comments":[...]}}}"""
+    """Оцінки, коментарі, статуси перевірки та призначення по кожній статті.
+    Структура: {учасник: {стаття: {"scores":{журі:бал}, "comments":[...],
+                                   "reviewed":[журі], "assigned":[журі]}}}"""
     assess = {}
+
+    def slot(p, a):
+        return assess.setdefault(p, {}).setdefault(
+            a, {"scores": {}, "comments": [], "reviewed": [], "assigned": []})
+
     for r in db().execute("SELECT * FROM article_scores WHERE contest_id=?", (cid,)):
-        p = assess.setdefault(r["participant"], {})
-        a = p.setdefault(r["article"], {"scores": {}, "comments": []})
-        a["scores"][r["jury"]] = r["value"]
+        slot(r["participant"], r["article"])["scores"][r["jury"]] = r["value"]
     for r in db().execute(
             "SELECT * FROM article_comments WHERE contest_id=? ORDER BY id", (cid,)):
-        p = assess.setdefault(r["participant"], {})
-        a = p.setdefault(r["article"], {"scores": {}, "comments": []})
-        a["comments"].append({"jury": r["jury_name"], "text": r["text"], "date": r["date"]})
+        slot(r["participant"], r["article"])["comments"].append(
+            {"jury": r["jury_name"], "text": r["text"], "date": r["date"]})
+    for r in db().execute("SELECT * FROM article_reviews WHERE contest_id=?", (cid,)):
+        slot(r["participant"], r["article"])["reviewed"].append(r["jury"])
+    for r in db().execute(
+            "SELECT * FROM article_assignments WHERE contest_id=? ORDER BY jury", (cid,)):
+        slot(r["participant"], r["article"])["assigned"].append(r["jury"])
     return assess
+
+def split_stats(r):
+    """Нові та доповнені статті учасника: кількість і додані байти."""
+    s = {"created": 0, "expanded": 0, "bc": 0, "be": 0}
+    for pp in ((r or {}).get("perProject") or {}).values():
+        for it in (pp.get("list") or []):
+            if it.get("created"):
+                s["created"] += 1
+                s["bc"] += it.get("bytes", 0)
+            else:
+                s["expanded"] += 1
+                s["be"] += it.get("bytes", 0)
+    return s
 
 def article_quality(participant_assess):
     """Якість учасника = середнє арифметичне середніх оцінок по кожній статті
@@ -1067,7 +1358,9 @@ def index():
         tjson=json.dumps(T[l], ensure_ascii=False),
         cjson=json.dumps(contest, ensure_ascii=False) if contest else "null",
         rjson=json.dumps(results, ensure_ascii=False) if results else "null",
-        ajson=json.dumps(assess, ensure_ascii=False))
+        ajson=json.dumps(assess, ensure_ascii=False),
+        juryjson=json.dumps([{"login": u.login, "name": u.name, "role": u.role} for u in users],
+                            ensure_ascii=False).replace("</", "<\\/"))
 
 @app.route("/admin/contest/save", methods=["POST"])
 @admin_required
@@ -1094,7 +1387,8 @@ def contest_save():
 @admin_required
 def contest_delete():
     cid = request.form["id"]
-    for tbl in ("contests", "results", "scores", "comments"):
+    for tbl in ("contests", "results", "scores", "comments", "article_scores",
+                "article_comments", "article_reviews", "article_assignments"):
         db().execute(f"DELETE FROM {tbl} WHERE {'id' if tbl=='contests' else 'contest_id'}=?", (cid,))
     db().commit()
     return redirect(url_for("index", view="admin"))
@@ -1145,13 +1439,30 @@ def api_results(cid):
 def api_score():
     d = request.get_json()
     article = d.get("article", "")
+    me = session["user"]["login"]
     if d.get("value") is None:
         db().execute("DELETE FROM article_scores WHERE contest_id=? AND participant=? AND article=? AND jury=?",
-                     (d["contest"], d["participant"], article, session["user"]["login"]))
+                     (d["contest"], d["participant"], article, me))
     else:
         db().execute("""INSERT INTO article_scores VALUES(?,?,?,?,?)
             ON CONFLICT(contest_id,participant,article,jury) DO UPDATE SET value=excluded.value""",
-            (d["contest"], d["participant"], article, session["user"]["login"], float(d["value"])))
+            (d["contest"], d["participant"], article, me, float(d["value"])))
+        # виставлена оцінка автоматично означає, що статтю перевірено
+        db().execute("INSERT OR IGNORE INTO article_reviews VALUES(?,?,?,?)",
+                     (d["contest"], d["participant"], article, me))
+    db().commit()
+    return jsonify(ok=True)
+
+@app.route("/api/review", methods=["POST"])
+@login_required
+def api_review():
+    d = request.get_json()
+    key = (d["contest"], d["participant"], d.get("article", ""), session["user"]["login"])
+    if d.get("reviewed"):
+        db().execute("INSERT OR IGNORE INTO article_reviews VALUES(?,?,?,?)", key)
+    else:
+        db().execute("DELETE FROM article_reviews WHERE contest_id=? AND participant=? "
+                     "AND article=? AND jury=?", key)
     db().commit()
     return jsonify(ok=True)
 
@@ -1164,6 +1475,63 @@ def api_comment():
                   d["text"][:2000], time.strftime("%Y-%m-%d %H:%M")))
     db().commit()
     return jsonify(ok=True)
+
+@app.route("/api/distribute/<cid>", methods=["POST"])
+@login_required
+def api_distribute(cid):
+    """Рівномірно розподіляє статті конкурсу між журі (лише адмін).
+    Вже наявні призначення зберігаються; нові статті йдуть журі з найменшим навантаженням."""
+    if session["user"]["role"] != "admin":
+        return jsonify(error="forbidden"), 403
+    d = request.get_json(silent=True) or {}
+    con = db()
+    rr = con.execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
+    results = json.loads(rr["data"]) if rr else {}
+    items, seen = [], set()
+    for user in sorted(results):
+        for pp in ((results[user] or {}).get("perProject") or {}).values():
+            for it in (pp.get("list") or []):
+                k = (user, it.get("title", ""))
+                if k[1] and k not in seen:
+                    seen.add(k)
+                    items.append(k)
+    if not items:
+        return jsonify(error="no_results"), 400
+    pool = [r["login"] for r in con.execute(
+        "SELECT login FROM users WHERE role='jury' ORDER BY login")]
+    if not pool:
+        return jsonify(error="no_jury"), 400
+    try:
+        per = max(1, min(int(d.get("per_article") or 1), len(pool)))
+    except (TypeError, ValueError):
+        per = 1
+    if d.get("reset"):
+        con.execute("DELETE FROM article_assignments WHERE contest_id=?", (cid,))
+    load = {j: 0 for j in pool}
+    have = {}
+    existing = con.execute("SELECT participant, article, jury FROM article_assignments "
+                           "WHERE contest_id=?", (cid,)).fetchall()
+    for r in existing:
+        k = (r["participant"], r["article"])
+        if k in seen and r["jury"] in load:
+            have.setdefault(k, set()).add(r["jury"])
+            load[r["jury"]] += 1
+        else:  # застаріле призначення: статті вже немає або журі видалено
+            con.execute("DELETE FROM article_assignments WHERE contest_id=? AND participant=? "
+                        "AND article=? AND jury=?", (cid, r["participant"], r["article"], r["jury"]))
+    rnd = random.Random(cid)
+    rnd.shuffle(items)
+    for k in items:
+        got = have.setdefault(k, set())
+        while len(got) < per:
+            cand = [j for j in pool if j not in got]
+            j = min(cand, key=lambda x: (load[x], rnd.random()))
+            con.execute("INSERT OR IGNORE INTO article_assignments VALUES(?,?,?,?)",
+                        (cid, k[0], k[1], j))
+            got.add(j)
+            load[j] += 1
+    con.commit()
+    return jsonify(ok=True, items=len(items), load=load)
 
 @app.route("/api/state/<cid>")
 @login_required
@@ -1195,9 +1563,11 @@ def export_csv(cid):
         r = results.get(user)
         a = assess.get(user, {})
         quality, n = article_quality(a)
+        sp = split_stats(r)
         score = eval_formula(contest["formula"],
                              {"bytes": r["bytes"], "edits": r["edits"],
-                              "articles": r["articles"], "quality": quality}) if r else None
+                              "articles": r["articles"], "quality": quality,
+                              "created": sp["created"], "expanded": sp["expanded"]}) if r else None
         all_comments = []
         for art, ad in a.items():
             for c in ad.get("comments", []):
@@ -1210,7 +1580,7 @@ def export_csv(cid):
     w = csv.writer(buf, delimiter=",")
     head = ["#", t["th_u"]]
     if quant:
-        head += [t["th_b"]] + hosts + [t["th_e"]]
+        head += [t["th_b"]] + hosts + [t["th_e"], t["th_split"], t["th_split_b"]]
     if qual:
         head += [t["th_avg"], t["th_score"], t["comments"]]
     w.writerow(head)
@@ -1222,6 +1592,9 @@ def export_csv(cid):
                 pp = (r or {}).get("perProject", {}).get(h)
                 line.append(pp.get("bytes", t["err"]) if pp else "")
             line.append(f"{r['edits']} / {r['articles']}" if r else "")
+            sp = split_stats(r) if r else None
+            line.append(f"{sp['created']} / {sp['expanded']}" if sp else "")
+            line.append(f"{sp['bc']} / {sp['be']}" if sp else "")
         if qual:
             line += [round(quality, 2) if n else "",
                      round(score, 2) if score is not None else "",
