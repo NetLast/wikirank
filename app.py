@@ -311,6 +311,12 @@ _EXTRA = {
 }
 for _l, _d in _EXTRA.items():
     T[_l].update(_d)
+T["uk"].update(legacy_title="Перевірено до оновлення",
+               legacy_h="Внесок оцінено в попередній версії: оцінка враховується в якості, статті не розподіляються.")
+T["en"].update(legacy_title="Reviewed before the update",
+               legacy_h="This contribution was assessed in the previous version: its score counts toward quality, and its articles are not distributed.")
+T["pl"].update(legacy_title="Sprawdzono przed aktualizacją",
+               legacy_h="Ten wkład oceniono w poprzedniej wersji: ocena liczy się do jakości, a artykuły nie są rozdzielane.")
 
 def lang():
     l = request.args.get("lang") or session.get("lang") or "uk"
@@ -688,11 +694,14 @@ let CUR_LIST=[];      // поточний відфільтрований спи�
 let SCROLL_RESET=false;
 let MTAB='article';   // 'preview' | 'article' | 'history'
 const JURY_LIST={{juryjson|safe}};
+const LEGACY={{ljson|safe}}; // оцінки/коментарі з попередньої версії (рівень учасника)
+function legacyDone(user){const l=LEGACY[user];return !!(l&&(Object.keys(l.scores||{}).length||(l.comments||[]).length))}
+function legacyVals(user){const l=LEGACY[user];return l?Object.values(l.scores||{}).filter(v=>v!=null):[]}
 function setArtFilter(f){ART_FILTER=f;SCROLL_RESET=true;render()}
 function setRevFilter(f){REV_FILTER=f;SCROLL_RESET=true;render()}
 function articleLink(origin,title){return origin+'/wiki/'+encodeURIComponent(title.replace(/ /g,'_'))}
 function slot(user,title){const a=ASSESS[user]&&ASSESS[user][title];return a||{scores:{},comments:[],reviewed:[],assigned:[]}}
-function isReviewed(user,title){return (slot(user,title).reviewed||[]).indexOf(JURY_LOGIN)>=0}
+function isReviewed(user,title){return legacyDone(user)||(slot(user,title).reviewed||[]).indexOf(JURY_LOGIN)>=0}
 function isMine(user,title){return (slot(user,title).assigned||[]).indexOf(JURY_LOGIN)>=0}
 function juryName(login){const j=JURY_LIST.find(x=>x.login===login);return j?j.name:login}
 async function reloadState(){const r=await fetch('/api/state/'+CID);ASSESS=(await r.json()).assess}
@@ -846,7 +855,7 @@ function rightHtml(){
  h+='<span class="hint mono">'+T.th_avg+': '+(avg!=null?avg.toFixed(2):'—')+(vals.length?' ('+vals.length+' '+T.scores_n+')':'')+'</span></div>';
  h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">';
  h+='<button class="btn-p" onclick="reviewAndNext()">'+(rev?T.next+' ›':T.rev_next)+'</button>';
- h+='<button class="btn-s" onclick="toggleReviewed()">'+(rev?T.unmark_rev:T.mark_rev)+'</button></div>';
+ h+=(legacyDone(m.user)?'':'<button class="btn-s" onclick="toggleReviewed()">'+(rev?T.unmark_rev:T.mark_rev)+'</button>')+'</div>';
  h+='<div style="margin-top:14px">';
  (ad.comments||[]).forEach(c=>{h+='<div style="padding:5px 0;border-bottom:1px dashed var(--line)"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span><div>'+esc(c.text)+'</div></div>'});
  if(!(ad.comments||[]).length)h+='<div class="hint" style="font-size:12px">'+T.no_comments+'</div>';
@@ -879,13 +888,14 @@ function renderModal(){
  const nw=rt.querySelector('.md-cm');
  if(nw&&same){nw.value=draft;if(hadFocus)nw.focus()}
 }
-function articleQuality(pa){
+function articleQuality(pa,user){
  if(!pa)return{quality:0,n:0};
  const avgs=[];let n=0;
  Object.values(pa).forEach(a=>{
   const vals=Object.values(a.scores||{}).filter(v=>v!=null);
   if(vals.length){avgs.push(vals.reduce((x,y)=>x+y,0)/vals.length);n+=vals.length}
  });
+ if(!avgs.length&&user){const lv=legacyVals(user);if(lv.length)return{quality:lv.reduce((x,y)=>x+y,0)/lv.length,n:lv.length}}
  return{quality:avgs.length?avgs.reduce((x,y)=>x+y,0)/avgs.length:0,n};
 }
 function evalFormula(f,v){
@@ -921,7 +931,7 @@ function render(){
  CUR_LIST=[];
  const rows=CONTEST.participants.map(user=>{
   const r=RESULTS?RESULTS[user]:null;const pa=ASSESS[user]||{};
-  const{quality,n}=articleQuality(pa);
+  const{quality,n}=articleQuality(pa,user);
   const sp=splitStats(r);
   const score=r?evalFormula(CONTEST.formula,{bytes:r.bytes,edits:r.edits,articles:r.articles,quality,created:sp.created,expanded:sp.expanded}):null;
   const titles=partTitles(r);
@@ -959,6 +969,13 @@ function render(){
   h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="toggleArt('+i+')">'+T.articles_btn+(row.r?' ('+row.r.articles+')':'')+'</button>':'')+'</td></tr>';
   if(QUAL&&ARTOPEN===row.user){
    h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:1000px">';
+   if(legacyDone(row.user)){
+    const lg=LEGACY[row.user],lv=legacyVals(row.user);
+    h+='<div style="margin-bottom:10px;padding:10px 12px;border-radius:10px;background:#e6f4ea"><b>✓ '+T.legacy_title+'</b>'
+     +(lv.length?' · '+T.th_avg+': '+(lv.reduce((x,y)=>x+y,0)/lv.length).toFixed(2)+' ('+lv.length+' '+T.scores_n+')':'');
+    (lg.comments||[]).forEach(c=>{h+='<div style="padding:3px 0"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span> '+esc(c.text)+'</div>'});
+    h+='<div class="hint" style="margin-top:4px">'+T.legacy_h+'</div></div>';
+   }
    const items=[];
    projects.forEach(p=>{const pp=row.r?row.r.perProject[p.host]:null;
     (pp&&pp.list?pp.list:[]).forEach(it=>items.push({...it,origin:p.origin,label:p.label,host:p.host,api:p.api}))});
@@ -1256,20 +1273,40 @@ def split_stats(r):
                 s["be"] += it.get("bytes", 0)
     return s
 
-def article_quality(participant_assess):
+def get_legacy(cid):
+    """Оцінки та коментарі, виставлені в попередній версії (на рівні учасника, а не статті).
+    Структура: {учасник: {"scores": {журі: бал}, "comments": [...]}}"""
+    out = {}
+
+    def slot(p):
+        return out.setdefault(p, {"scores": {}, "comments": []})
+
+    for r in db().execute("SELECT participant, jury, value FROM scores WHERE contest_id=?", (cid,)):
+        if r["value"] is not None:
+            slot(r["participant"])["scores"][r["jury"]] = r["value"]
+    for r in db().execute("SELECT participant, jury_name, text, date FROM comments "
+                          "WHERE contest_id=? ORDER BY id", (cid,)):
+        slot(r["participant"])["comments"].append(
+            {"jury": r["jury_name"], "text": r["text"], "date": r["date"]})
+    return out
+
+def article_quality(participant_assess, legacy=None):
     """Якість учасника = середнє арифметичне середніх оцінок по кожній статті
-    (спершу усереднюємо оцінки журі в межах статті, потім — по статтях)."""
-    if not participant_assess:
-        return 0.0, 0
+    (спершу усереднюємо оцінки журі в межах статті, потім — по статтях).
+    Якщо оцінок по статтях немає, але є оцінки з попередньої версії — беремо їх середнє."""
     article_avgs = []
     n = 0
-    for a in participant_assess.values():
+    for a in (participant_assess or {}).values():
         vals = [v for v in (a.get("scores") or {}).values() if v is not None]
         if vals:
             article_avgs.append(sum(vals) / len(vals))
             n += len(vals)
-    quality = sum(article_avgs) / len(article_avgs) if article_avgs else 0.0
-    return quality, n
+    if article_avgs:
+        return sum(article_avgs) / len(article_avgs), n
+    old = [v for v in ((legacy or {}).get("scores") or {}).values() if v is not None]
+    if old:
+        return sum(old) / len(old), len(old)
+    return 0.0, 0
 
 class D(dict):
     __getattr__ = dict.get
@@ -1360,7 +1397,9 @@ def index():
         rjson=json.dumps(results, ensure_ascii=False) if results else "null",
         ajson=json.dumps(assess, ensure_ascii=False),
         juryjson=json.dumps([{"login": u.login, "name": u.name, "role": u.role} for u in users],
-                            ensure_ascii=False).replace("</", "<\\/"))
+                            ensure_ascii=False).replace("</", "<\\/"),
+        ljson=json.dumps(get_legacy(contest.id) if contest else {},
+                         ensure_ascii=False).replace("</", "<\\/"))
 
 @app.route("/admin/contest/save", methods=["POST"])
 @admin_required
@@ -1488,7 +1527,10 @@ def api_distribute(cid):
     rr = con.execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
     results = json.loads(rr["data"]) if rr else {}
     items, seen = [], set()
+    legacy = get_legacy(cid)
     for user in sorted(results):
+        if user in legacy and (legacy[user]["scores"] or legacy[user]["comments"]):
+            continue  # внесок уже перевірено в попередній версії
         for pp in ((results[user] or {}).get("perProject") or {}).values():
             for it in (pp.get("list") or []):
                 k = (user, it.get("title", ""))
@@ -1552,6 +1594,7 @@ def export_csv(cid):
     rr = db().execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
     results = json.loads(rr["data"]) if rr else {}
     assess = get_assess(cid)
+    legacy = get_legacy(cid)
     hosts = []
     for p in contest["projects"]:
         m = re.match(r"https?://([^/]+)", p)
@@ -1562,13 +1605,14 @@ def export_csv(cid):
     for user in contest["participants"]:
         r = results.get(user)
         a = assess.get(user, {})
-        quality, n = article_quality(a)
+        quality, n = article_quality(a, legacy.get(user))
         sp = split_stats(r)
         score = eval_formula(contest["formula"],
                              {"bytes": r["bytes"], "edits": r["edits"],
                               "articles": r["articles"], "quality": quality,
                               "created": sp["created"], "expanded": sp["expanded"]}) if r else None
-        all_comments = []
+        all_comments = [f"[{t['legacy_title']}] {c['jury']} ({c['date']}): {c['text']}"
+                        for c in (legacy.get(user) or {}).get("comments", [])]
         for art, ad in a.items():
             for c in ad.get("comments", []):
                 all_comments.append(f"[{art}] {c['jury']} ({c['date']}): {c['text']}")
