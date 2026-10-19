@@ -315,6 +315,9 @@ T["uk"].update(legacy_title="Перевірено до оновлення",
                legacy_h="Внесок оцінено в попередній версії: оцінка враховується в якості, статті не розподіляються.")
 T["en"].update(legacy_title="Reviewed before the update",
                legacy_h="This contribution was assessed in the previous version: its score counts toward quality, and its articles are not distributed.")
+T["uk"].update(my_progress_title="Мій прогрес")
+T["en"].update(my_progress_title="My progress")
+T["pl"].update(my_progress_title="Mój postęp")
 T["pl"].update(legacy_title="Sprawdzono przed aktualizacją",
                legacy_h="Ten wkład oceniono w poprzedniej wersji: ocena liczy się do jakości, a artykuły nie są rozdzielane.")
 
@@ -1193,7 +1196,8 @@ ANALYSIS_TPL = """
 </div>
 <div id="loadbox" class="card" style="display:none">
  <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end">
-  <div><div class="lbl" style="margin:0">{{t.load_title}}</div><div class="hint">{{t.distribute_h}}</div></div>
+  <div><div class="lbl" style="margin:0">{{t.load_title if me.role=='admin' else t.my_progress_title}}</div>
+   {% if me.role=='admin' %}<div class="hint">{{t.distribute_h}}</div>{% endif %}</div>
   {% if me.role=='admin' %}
   <div style="margin-left:auto;display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
    <div><label class="lbl" style="margin:0 0 2px">{{t.per_article}}</label><input id="distPer" type="number" min="1" value="1" style="width:70px"></div>
@@ -1237,7 +1241,7 @@ def get_contests():
         out.append(c)
     return out
 
-def get_assess(cid):
+def get_assess(cid, only=None):
     """Оцінки, коментарі, статуси перевірки та призначення по кожній статті.
     Структура: {учасник: {стаття: {"scores":{журі:бал}, "comments":[...],
                                    "reviewed":[журі], "assigned":[журі]}}}"""
@@ -1254,10 +1258,12 @@ def get_assess(cid):
         slot(r["participant"], r["article"])["comments"].append(
             {"jury": r["jury_name"], "text": r["text"], "date": r["date"]})
     for r in db().execute("SELECT * FROM article_reviews WHERE contest_id=?", (cid,)):
-        slot(r["participant"], r["article"])["reviewed"].append(r["jury"])
+        if only is None or r["jury"] == only:
+            slot(r["participant"], r["article"])["reviewed"].append(r["jury"])
     for r in db().execute(
             "SELECT * FROM article_assignments WHERE contest_id=? ORDER BY jury", (cid,)):
-        slot(r["participant"], r["article"])["assigned"].append(r["jury"])
+        if only is None or r["jury"] == only:
+            slot(r["participant"], r["article"])["assigned"].append(r["jury"])
     return assess
 
 def split_stats(r):
@@ -1384,7 +1390,7 @@ def index():
     if contest:
         rr = db().execute("SELECT data FROM results WHERE contest_id=?", (contest.id,)).fetchone()
         results = json.loads(rr["data"]) if rr else None
-        assess = get_assess(contest.id)
+        assess = get_assess(contest.id, None if me.role == "admin" else me.login)
     tpl = MAIN_HTML.replace("{% include 'ADMIN' %}", ADMIN_TPL)\
                    .replace("{% include 'ANALYSIS' %}", ANALYSIS_TPL)
     users = [D(dict(u)) for u in db().execute("SELECT * FROM users").fetchall()]
@@ -1396,7 +1402,8 @@ def index():
         cjson=json.dumps(contest, ensure_ascii=False) if contest else "null",
         rjson=json.dumps(results, ensure_ascii=False) if results else "null",
         ajson=json.dumps(assess, ensure_ascii=False),
-        juryjson=json.dumps([{"login": u.login, "name": u.name, "role": u.role} for u in users],
+        juryjson=json.dumps([{"login": u.login, "name": u.name, "role": u.role} for u in users
+                             if me.role == "admin" or u.login == me.login],
                             ensure_ascii=False).replace("</", "<\\/"),
         ljson=json.dumps(get_legacy(contest.id) if contest else {},
                          ensure_ascii=False).replace("</", "<\\/"))
@@ -1578,7 +1585,8 @@ def api_distribute(cid):
 @app.route("/api/state/<cid>")
 @login_required
 def api_state(cid):
-    return jsonify(assess=get_assess(cid))
+    return jsonify(assess=get_assess(cid, None if session["user"]["role"] == "admin"
+                                     else session["user"]["login"]))
 
 # ── Експорт CSV ──────────────────────────────────────────────
 @app.route("/export/<cid>.csv")
