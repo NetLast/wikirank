@@ -605,6 +605,7 @@ async function extractParticipants(){
 const CONTEST={{cjson|safe}};
 let RESULTS={{rjson|safe}}, ASSESS={{ajson|safe}};
 const JURY_LOGIN={{me.login|tojson}};
+const IS_JURY={{(me.role=='jury')|tojson}};
 let QUANT=true,QUAL=false;
 const projects=(CONTEST?CONTEST.projects:[]).map(p=>{try{const u=new URL(p);
  return{origin:u.origin,api:u.origin+'/w/api.php',label:u.hostname.replace('.org',''),host:u.hostname}}catch(e){return null}}).filter(Boolean);
@@ -961,7 +962,7 @@ function render(){
   const done=titles.filter(t=>isReviewed(user,t)).length;
   const mineT=titles.filter(t=>isMine(user,t));
   const mineDone=mineT.filter(t=>isReviewed(user,t)).length;
-  return{user,r,pa,quality,n,score,sp,total:titles.length,done,mine:mineT.length,mineDone};
+  return{user,r,pa,quality,n,score,sp,total:IS_JURY?mineT.length:titles.length,done:IS_JURY?mineDone:done,mine:mineT.length,mineDone};
  }).sort((x,y)=>QUAL?((y.score??-1e18)-(x.score??-1e18)):((y.r?y.r.bytes:-1)-(x.r?x.r.bytes:-1)));
  const hiddenN=allRows.filter(x=>x.r&&x.r.bytes<MIN_BYTES).length;
  const rows=allRows.filter(x=>!(x.r&&x.r.bytes<MIN_BYTES));
@@ -989,9 +990,9 @@ function render(){
    h+='<td class="mono">'+(row.n?row.quality.toFixed(2):'—')+'<div class="hint">'+row.n+' '+T.scores_n+'</div></td>';
    h+='<td><span class="mono" style="font-weight:700;color:var(--gold);font-size:15px">'+(row.score!=null?row.score.toFixed(2):'—')+'</span></td>';
    h+='<td class="mono" style="font-size:12px">'+(row.total?row.done+' / '+row.total:'—')
-    +(row.mine?'<div class="hint">'+T.my_assigned+': '+row.mineDone+' / '+row.mine+'</div>':'')+'</td>';
+    +(row.mine&&!IS_JURY?'<div class="hint">'+T.my_assigned+': '+row.mineDone+' / '+row.mine+'</div>':'')+'</td>';
   }
-  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="toggleArt('+i+')">'+T.articles_btn+(row.r?' ('+row.r.articles+')':'')+'</button>':'')+'</td></tr>';
+  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="toggleArt('+i+')">'+T.articles_btn+(row.r?' ('+(IS_JURY?row.mine:row.r.articles)+')':'')+'</button>':'')+'</td></tr>';
   if(QUAL&&ARTOPEN===row.user){
    h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:1000px">';
    if(legacyDone(row.user)){
@@ -1003,7 +1004,7 @@ function render(){
    }
    const items=[];
    projects.forEach(p=>{const pp=row.r?row.r.perProject[p.host]:null;
-    (pp&&pp.list?pp.list:[]).filter(inScope).forEach(it=>items.push({...it,origin:p.origin,label:p.label,host:p.host,api:p.api}))});
+    (pp&&pp.list?pp.list:[]).filter(inScope).filter(it=>!IS_JURY||isMine(row.user,it.title)).forEach(it=>items.push({...it,origin:p.origin,label:p.label,host:p.host,api:p.api}))});
    // спершу неперевірені мною, серед них — призначені мені, далі за приростом байтів
    items.sort((a,b2)=>{
     const ra=isReviewed(row.user,a.title)?1:0,rb=isReviewed(row.user,b2.title)?1:0;
@@ -1032,7 +1033,7 @@ function render(){
     h+=btn('rev-filt-btn','all',REV_FILTER,T.filter_all);
     h+=btn('rev-filt-btn','todo',REV_FILTER,T.filter_todo+' ('+(items.length-nDone)+')');
     h+=btn('rev-filt-btn','done',REV_FILTER,T.filter_done+' ('+nDone+')');
-    h+=btn('rev-filt-btn','mine',REV_FILTER,T.filter_mine+' ('+nMine+')');
+    if(!IS_JURY)h+=btn('rev-filt-btn','mine',REV_FILTER,T.filter_mine+' ('+nMine+')');
     h+='</div>';
     const filtered=items.filter(it=>{
      if(ART_FILTER==='created'&&!it.created)return false;
@@ -1241,7 +1242,7 @@ ANALYSIS_TPL = """
  <div id="loadtbl" style="margin-top:8px"></div>
 </div>
 <div class="card" style="padding:0;overflow-x:auto"><div id="tbl"></div></div>
-<div class="hint">{{t.f_of}} <span class="chip">{{contest.formula}}</span> · {{t.scope_label}} <span class="chip">{{t['scope_'~(contest.review_scope or 'all')]}}</span></div>
+<div class="hint">{{t.f_of}} <span class="chip">{{contest.formula if contest.formula else '—'}}</span> · {{t.scope_label}} <span class="chip">{{t['scope_'~(contest.review_scope or 'all')]}}</span></div>
 {% endif %}
 {% if me.role=='jury' %}
 <div class="card" style="max-width:400px;margin-top:14px">
@@ -1459,8 +1460,8 @@ def contest_save():
     projects = [s.strip() for s in f.get("projects", "").splitlines() if s.strip()]
     participants = [s.strip() for s in f.get("participants", "").splitlines() if s.strip()]
     formula = f.get("formula", "").strip()
-    if not validate_formula(formula):
-        formula = "bytes / 1000 + quality * 10"
+    if formula and not validate_formula(formula):
+        formula = "bytes / 1000 + quality * 10"  # некоректну підміняємо; порожню залишаємо порожньою
     cid = f.get("id") or "c" + hex(int(time.time() * 1000))[2:]
     scope = f.get("review_scope") if f.get("review_scope") in ("all", "created", "expanded") else "all"
     db().execute("""INSERT INTO contests VALUES(?,?,?,?,?,?,?,?,?,?)
