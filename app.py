@@ -965,7 +965,7 @@ function render(){
   return{user,r,pa,quality,n,score,sp,total:IS_JURY?mineT.length:titles.length,done:IS_JURY?mineDone:done,mine:mineT.length,mineDone};
  }).sort((x,y)=>QUAL?((y.score??-1e18)-(x.score??-1e18)):((y.r?y.r.bytes:-1)-(x.r?x.r.bytes:-1)));
  const hiddenN=allRows.filter(x=>x.r&&x.r.bytes<MIN_BYTES).length;
- const rows=allRows.filter(x=>!(x.r&&x.r.bytes<MIN_BYTES));
+ const rows=allRows.filter(x=>!(x.r&&x.r.bytes<MIN_BYTES)&&!(IS_JURY&&QUAL&&x.r&&!x.mine));
  ROWS_CUR=rows;
  const maxB=Math.max(1,...rows.map(r=>r.r?r.r.bytes:0));
  let h='<table><thead><tr><th>#</th><th>'+T.th_u+'</th>';
