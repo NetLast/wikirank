@@ -337,6 +337,10 @@ T["pl"].update(hidden_min="Ukryci uczestnicy z wkładem poniżej minimalnego pro
 T["pl"].update(legacy_title="Sprawdzono przed aktualizacją",
                legacy_h="Ten wkład oceniono w poprzedniej wersji: ocena liczy się do jakości, a artykuły nie są rozdzielane.")
 
+T["uk"].update(hist_date="Дата", hist_user="Користувач", hist_size="Байти", hist_comment="Опис редагування")
+T["en"].update(hist_date="Date", hist_user="User", hist_size="Bytes", hist_comment="Edit summary")
+T["pl"].update(hist_date="Data", hist_user="Użytkownik", hist_size="Bajty", hist_comment="Opis edycji")
+
 def lang():
     l = request.args.get("lang") or session.get("lang") or "uk"
     if l not in T:
@@ -827,6 +831,51 @@ async function openItem(it){
  }
 }
 function closeModal(){MODAL=null;renderModal()}
+// Вікіпедія забороняє показ сторінки історії в iframe (X-Frame-Options),
+// тому статтю беремо через REST API (посилання відкриваються в новій вкладці),
+// а історію будуємо з API MediaWiki.
+const ART_CACHE={},HIST_CACHE={},LEFT_PENDING=new Set();
+async function ensureLeftData(){
+ if(!MODAL)return;
+ const m=MODAL,key=m.host+'::'+m.title;
+ const still=()=>MODAL&&MODAL.host===m.host&&MODAL.title===m.title;
+ if(MTAB==='article'&&!ART_CACHE[key]&&!LEFT_PENDING.has('a'+key)){
+  LEFT_PENDING.add('a'+key);
+  try{
+   let html;
+   try{
+    const r=await fetch(m.origin+'/api/rest_v1/page/mobile-html/'+encodeURIComponent(m.title.replace(/ /g,'_')));
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    html=await r.text();
+    html=html.replace(/<script[\\s\\S]*?<\\/script>/gi,'');
+    html=html.replace(/<head[^>]*>/i,x=>x+'<base href="'+m.origin+'/" target="_blank">');
+   }catch(e1){
+    // запасний варіант: HTML статті через action=parse (CORS), без оболонки сайту
+    const d=await mw(m.api,{action:'parse',page:m.title,prop:'text',redirects:'1',disableeditsection:'1',disablelimitreport:'1',formatversion:'2'});
+    if(!d.parse)throw e1;
+    html='<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><base href="'+m.origin+'/" target="_blank"><style>'
+     +'body{font:15px/1.6 system-ui,sans-serif;padding:14px 18px;max-width:900px;margin:0 auto;color:#101820}'
+     +'img{max-width:100%;height:auto}table{max-width:100%;display:block;overflow:auto}.mw-editsection,.navbox,.noprint{display:none}'
+     +'a{color:#1c5250}</style></head><body><h1>'+esc(d.parse.title)+'</h1>'+d.parse.text+'</body></html>';
+   }
+   // усі посилання — лише в новій вкладці: Вікіпедія забороняє показ службових сторінок (історія тощо) в iframe
+   html=html.replace(/<a(\\s)/gi,'<a target="_blank" rel="noopener"$1');
+   ART_CACHE[key]={html};
+  }catch(e){ART_CACHE[key]={err:String(e.message||e)}}
+  LEFT_PENDING.delete('a'+key);if(still())renderModal();
+ }
+ if(MTAB==='history'&&!HIST_CACHE[key]&&!LEFT_PENDING.has('h'+key)){
+  LEFT_PENDING.add('h'+key);
+  try{
+   const d=await mw(m.api,{action:'query',prop:'revisions',titles:m.title,rvprop:'ids|user|timestamp|comment|size',rvlimit:'50',redirects:'1'});
+   const page=Object.values(d.query?.pages||{})[0];
+   const rows=(page&&page.revisions)||[];
+   for(let i=0;i<rows.length;i++)rows[i].diff=rows[i+1]?rows[i].size-rows[i+1].size:rows[i].size;
+   HIST_CACHE[key]={rows};
+  }catch(e){HIST_CACHE[key]={err:String(e.message||e)}}
+  LEFT_PENDING.delete('h'+key);if(still())renderModal();
+ }
+}
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&MODAL)closeModal()});
 function leftHtml(ex){
  const m=MODAL;
@@ -844,10 +893,30 @@ function leftHtml(ex){
    h+='<div style="font-size:14px;line-height:1.55;white-space:pre-wrap">'+esc(ex.extract||'')+'</div>';
   }
   h+='</div>';
+ }else if(MTAB==='history'){
+  const hs=HIST_CACHE[m.host+'::'+m.title];
+  h+='<div class="md-pane">';
+  if(!hs)h+='<div class="hint">'+T.loading+'</div>';
+  else if(hs.err)h+='<div class="hint">'+esc(hs.err)+'</div>';
+  else{
+   const enc=encodeURIComponent(m.title.replace(/ /g,'_'));
+   h+='<table><thead><tr><th>'+T.hist_date+'</th><th>'+T.hist_user+'</th><th>'+T.hist_size+'</th><th>'+T.hist_comment+'</th></tr></thead><tbody>';
+   hs.rows.forEach(r=>{
+    const d=(r.timestamp||'').replace('T',' ').replace('Z','').slice(0,16);
+    const col=r.diff>0?'var(--ok)':(r.diff<0?'var(--err)':'var(--mut)');
+    h+='<tr><td class="mono" style="font-size:12px;white-space:nowrap"><a class="wl" target="_blank" rel="noopener" href="'+esc(m.origin+'/w/index.php?title='+enc+'&diff=prev&oldid='+r.revid)+'">'+esc(d)+'</a></td>'
+     +'<td>'+esc(r.user||'')+'</td>'
+     +'<td class="mono" style="font-size:12px;color:'+col+'">'+(r.diff>0?'+':'')+fmtN(r.diff)+'</td>'
+     +'<td class="hint">'+esc(r.comment||'')+'</td></tr>';
+   });
+   h+='</tbody></table>';
+  }
+  h+='</div>';
  }else{
-  const enc=encodeURIComponent(m.title.replace(/ /g,'_'));
-  const src=MTAB==='history'?m.origin+'/w/index.php?title='+enc+'&action=history':articleLink(m.origin,m.title)+'?useskin=minerva';
-  h+='<iframe class="md-frame" src="'+esc(src)+'" sandbox="allow-same-origin allow-scripts allow-popups allow-popups-to-escape-sandbox"></iframe>';
+  const as=ART_CACHE[m.host+'::'+m.title];
+  if(!as)h+='<div class="md-pane"><div class="hint">'+T.loading+'</div></div>';
+  else if(as.html)h+='<iframe class="md-frame" srcdoc="'+esc(as.html)+'" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"></iframe>';
+  else h+='<div class="md-pane"><div class="hint">'+esc(as.err||'')+'</div><div style="margin-top:8px"><a class="wl" target="_blank" rel="noopener" href="'+esc(articleLink(m.origin,m.title))+'">'+T.open_article+' ↗</a></div></div>';
  }
  return h;
 }
@@ -898,7 +967,7 @@ function renderModal(){
  const ex=EXTRACT_CACHE[key];
  // ліва частина перебудовується лише при зміні статті/вкладки — щоб iframe не перезавантажувався
  const left=document.getElementById('mdLeft');
- const lk=key+'|'+MTAB+'|'+(MTAB==='preview'?(ex&&ex.extract!=null?'1':'0'):'');
+ const lk=key+'|'+MTAB+'|'+(MTAB==='preview'?(ex&&ex.extract!=null?'1':'0'):(MTAB==='article'?(ART_CACHE[key]?'1':'0'):(HIST_CACHE[key]?'1':'0')));
  if(left.dataset.k!==lk){
   left.dataset.k=lk;left.innerHTML=leftHtml(ex);
   left.querySelectorAll('[data-tab]').forEach(b=>{b.onclick=()=>setTab(b.dataset.tab)});
@@ -910,6 +979,7 @@ function renderModal(){
  rt.innerHTML=rightHtml();rt.dataset.k=key;
  const nw=rt.querySelector('.md-cm');
  if(nw&&same){nw.value=draft;if(hadFocus)nw.focus()}
+ ensureLeftData();
 }
 function articleQuality(pa,user,allowed){
  if(!pa)return{quality:0,n:0};
