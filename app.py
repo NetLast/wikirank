@@ -80,12 +80,16 @@ CREATE TABLE IF NOT EXISTS article_reviews(
 CREATE TABLE IF NOT EXISTS article_assignments(
   contest_id TEXT, participant TEXT, article TEXT, jury TEXT,
   PRIMARY KEY(contest_id, participant, article, jury));
+CREATE TABLE IF NOT EXISTS contest_jury(
+  contest_id TEXT, login TEXT, PRIMARY KEY(contest_id, login));
 """
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
     had_reviews = con.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='article_reviews'").fetchone()
+    had_cj = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='contest_jury'").fetchone()
     con.executescript(SCHEMA)
     if not had_reviews:
         # раніше «перевірено» = є оцінка; переносимо це в явні відмітки
@@ -96,6 +100,11 @@ def init_db():
         con.execute("ALTER TABLE contests ADD COLUMN tpl_talk_only INTEGER DEFAULT 0")
     if "review_scope" not in cols:
         con.execute("ALTER TABLE contests ADD COLUMN review_scope TEXT DEFAULT 'all'")
+    if not had_cj:
+        # раніше журі було спільним для всіх конкурсів: щоб не порушити перевірки, що вже тривають,
+        # додаємо всіх наявних журі до всіх наявних конкурсів (адмін зможе звузити склад)
+        con.execute("INSERT OR IGNORE INTO contest_jury "
+                    "SELECT c.id, u.login FROM contests c, users u WHERE u.role='jury'")
     cur = con.execute("SELECT COUNT(*) c FROM users")
     if cur.fetchone()[0] == 0:
         con.execute("INSERT INTO users VALUES(?,?,?,?)",
@@ -340,6 +349,203 @@ T["pl"].update(legacy_title="Sprawdzono przed aktualizacją",
 T["uk"].update(hist_date="Дата", hist_user="Користувач", hist_size="Байти", hist_comment="Опис редагування")
 T["en"].update(hist_date="Date", hist_user="User", hist_size="Bytes", hist_comment="Edit summary")
 T["pl"].update(hist_date="Data", hist_user="Użytkownik", hist_size="Bajty", hist_comment="Opis edycji")
+
+_NEW = {
+ "uk": dict(
+   th_created_n="Створено", th_expanded_n="Доповнено",
+   formula="Формула ранжування для журі (необов'язково — залиште порожнім, якщо не потрібна)",
+   contest_jury="Журі цього конкурсу",
+   contest_jury_h="Лише ці члени журі бачитимуть конкурс і отримуватимуть статті на перевірку. Уже виставлені оцінки та позначки не видаляються.",
+   no_jury_accounts="Спершу створіть облікові записи журі у вкладці «Журі та адміни».",
+   tpl_replace="Замінити поточний список учасників (а не додавати до нього)",
+   save_update="Зберегти й оновити дані",
+   upd_h="Змінили дати, шаблон чи учасників? «Зберегти й оновити дані» збереже зміни в цьому ж конкурсі (оцінки й коментарі лишаються) і одразу перерахує внесок.",
+   tip_th_u="Вікі-акаунт учасника",
+   tip_th_b="Сума доданих байтів за період конкурсу",
+   tip_th_e="Кількість редагувань / кількість унікальних сторінок",
+   tip_th_split="Кількість створених / доповнених статей",
+   tip_th_created_n="Скільки нових статей створив учасник",
+   tip_th_expanded_n="Скільки наявних статей учасник доповнив",
+   tip_th_avg="Середня оцінка журі: спершу по кожній статті, потім по всіх статтях",
+   tip_th_score="Бал за формулою конкурсу",
+   tip_th_progress="Скільки статей перевірено (для журі — з призначених вам)",
+   tip_user_link="Відкрити внесок учасника у вікі",
+   tip_quant="Кількісний внесок: байти, редагування, статті",
+   tip_qual="Якісний аналіз: оцінки журі, прогрес перевірки, список статей",
+   tip_export="Завантажити таблицю у форматі CSV",
+   tip_check="Завантажити з вікі актуальний внесок учасників за період конкурсу",
+   tip_distribute="Розподілити статті між журі цього конкурсу",
+   tip_per_article="Скільком членам журі призначати кожну статтю",
+   tip_reset="Скасувати поточні призначення й розподілити з нуля (оцінки та коментарі не видаляються)",
+   tip_articles_btn="Показати статті учасника",
+   tip_af_all="Усі статті учасника", tip_af_created="Лише створені статті", tip_af_expanded="Лише доповнені статті",
+   tip_rf_all="Без фільтра за статусом перевірки", tip_rf_todo="Статті, яких ви ще не перевірили",
+   tip_rf_done="Статті, які ви вже перевірили", tip_rf_mine="Статті, призначені вам",
+   tip_card="Відкрити статтю для перевірки",
+   tip_prev="Попередня стаття у списку", tip_next="Наступна стаття у списку", tip_close="Закрити (Esc)",
+   tip_status="Ви ще не перевірили цю статтю",
+   tip_unrev="Натисніть, щоб зняти позначку «перевірено»",
+   tip_rev_next="Позначити статтю перевіреною й відкрити наступну",
+   tip_next_btn="Відкрити наступну статтю",
+   tip_my_score="Ваша оцінка статті (число). Виставлена оцінка автоматично позначає статтю перевіреною",
+   tip_comment="Додати коментар до статті",
+   tip_tab_article="Показати статтю у вікні", tip_tab_history="Історія редагувань статті",
+   tip_tab_preview="Короткий опис і зображення зі статті",
+   tip_tab_c="Створення й редагування конкурсів", tip_tab_u="Облікові записи журі та адмінів",
+   tip_tab_p="Зміна вашого пароля",
+   tip_c_name="Назва конкурсу, яку бачать адміни та журі",
+   tip_projects="Вікі-проєкти, у яких рахується внесок, по одному посиланню в рядку",
+   tip_dstart="Редагування раніше цієї дати не враховуються",
+   tip_dend="Редагування пізніше цієї дати не враховуються",
+   tip_tpl="Посилання на шаблон, яким позначено статті конкурсу. Внесок рахується лише в цих статтях",
+   tip_talk="Увімкніть, якщо шаблон стоїть на сторінках обговорення статей",
+   tip_tpl_btn="Знайти статті з шаблоном і зібрати авторів їхніх редагувань за вказаний період",
+   tip_replace="Увімкнено: список учасників буде замінено знайденими. Вимкнено: знайдені додадуться до поточного списку",
+   tip_parts="Імена вікі-акаунтів учасників, по одному в рядку",
+   tip_scope="Які статті перевіряє журі: усі, лише нові чи лише доповнення",
+   tip_formula="Необов'язково. Порожня формула = не використовується. Змінні: bytes, edits, articles, quality, created, expanded",
+   tip_cjury="Хто з журі працює над цим конкурсом",
+   tip_save="Зберегти зміни конкурсу",
+   tip_save_update="Зберегти зміни та одразу заново перерахувати внесок за новими параметрами",
+   tip_edit="Змінити параметри конкурсу без створення нового",
+   tip_delete="Видалити конкурс разом з усіма оцінками й коментарями",
+   tip_role="Адмін налаштовує систему, журі лише оцінює статті",
+   tip_uname="Ім'я, яке буде видно в коментарях",
+   tip_ulogin="Логін для входу; для входу через MediaWiki — ім'я вікі-акаунта",
+   tip_upass="Пароль для входу",
+   tip_create_u="Створити обліковий запис",
+   tip_del_user="Видалити обліковий запис"),
+ "en": dict(
+   th_created_n="Created", th_expanded_n="Expanded",
+   formula="Ranking formula for the jury (optional — leave empty if not needed)",
+   contest_jury="Jury of this contest",
+   contest_jury_h="Only these jury members will see the contest and receive articles to review. Existing scores and marks are not deleted.",
+   no_jury_accounts="First create jury accounts in the “Jury & admins” tab.",
+   tpl_replace="Replace the current participant list (instead of adding to it)",
+   save_update="Save and refresh data",
+   upd_h="Changed dates, template or participants? “Save and refresh data” saves the changes in this same contest (scores and comments are kept) and recalculates contributions right away.",
+   tip_th_u="Participant's wiki account",
+   tip_th_b="Sum of added bytes during the contest period",
+   tip_th_e="Number of edits / number of unique pages",
+   tip_th_split="Number of created / expanded articles",
+   tip_th_created_n="How many new articles the participant created",
+   tip_th_expanded_n="How many existing articles the participant expanded",
+   tip_th_avg="Average jury score: first per article, then across articles",
+   tip_th_score="Score by the contest formula",
+   tip_th_progress="How many articles are reviewed (for jury — of those assigned to you)",
+   tip_user_link="Open the participant's contributions on the wiki",
+   tip_quant="Quantitative contribution: bytes, edits, articles",
+   tip_qual="Qualitative analysis: jury scores, review progress, article list",
+   tip_export="Download the table as CSV",
+   tip_check="Fetch up-to-date contributions of participants from the wiki for the contest period",
+   tip_distribute="Distribute articles among the jury of this contest",
+   tip_per_article="How many jurors each article is assigned to",
+   tip_reset="Drop current assignments and distribute from scratch (scores and comments are not deleted)",
+   tip_articles_btn="Show the participant's articles",
+   tip_af_all="All articles of the participant", tip_af_created="Created articles only", tip_af_expanded="Expanded articles only",
+   tip_rf_all="No filter by review status", tip_rf_todo="Articles you have not reviewed yet",
+   tip_rf_done="Articles you have already reviewed", tip_rf_mine="Articles assigned to you",
+   tip_card="Open the article for review",
+   tip_prev="Previous article in the list", tip_next="Next article in the list", tip_close="Close (Esc)",
+   tip_status="You have not reviewed this article yet",
+   tip_unrev="Click to remove the “reviewed” mark",
+   tip_rev_next="Mark the article as reviewed and open the next one",
+   tip_next_btn="Open the next article",
+   tip_my_score="Your score for the article (number). Giving a score automatically marks the article as reviewed",
+   tip_comment="Add a comment to the article",
+   tip_tab_article="Show the article in the frame", tip_tab_history="Edit history of the article",
+   tip_tab_preview="Short extract and image from the article",
+   tip_tab_c="Create and edit contests", tip_tab_u="Jury and admin accounts",
+   tip_tab_p="Change your password",
+   tip_c_name="Contest name shown to admins and jury",
+   tip_projects="Wiki projects where contributions are counted, one link per line",
+   tip_dstart="Edits before this date are not counted",
+   tip_dend="Edits after this date are not counted",
+   tip_tpl="Link to the template that marks contest articles. Contributions are counted only in these articles",
+   tip_talk="Enable if the template is placed on article talk pages",
+   tip_tpl_btn="Find articles with the template and collect authors of their edits within the given period",
+   tip_replace="On: the participant list is replaced with the found users. Off: found users are added to the current list",
+   tip_parts="Wiki usernames of participants, one per line",
+   tip_scope="Which articles the jury reviews: all, only new or only expansions",
+   tip_formula="Optional. Empty formula = not used. Variables: bytes, edits, articles, quality, created, expanded",
+   tip_cjury="Which jury members work on this contest",
+   tip_save="Save contest changes",
+   tip_save_update="Save changes and immediately recalculate contributions with the new parameters",
+   tip_edit="Change contest parameters without creating a new one",
+   tip_delete="Delete the contest together with all its scores and comments",
+   tip_role="Admins configure the system, jury only assess articles",
+   tip_uname="Name shown in comments",
+   tip_ulogin="Login name; for MediaWiki login — the wiki username",
+   tip_upass="Password for signing in",
+   tip_create_u="Create the account",
+   tip_del_user="Delete the account"),
+ "pl": dict(
+   th_created_n="Utworzone", th_expanded_n="Rozbudowane",
+   formula="Formuła rankingowa dla jury (opcjonalnie — zostaw puste, jeśli niepotrzebna)",
+   contest_jury="Jury tego konkursu",
+   contest_jury_h="Tylko ci członkowie jury zobaczą konkurs i dostaną artykuły do sprawdzenia. Wystawione oceny i oznaczenia nie są usuwane.",
+   no_jury_accounts="Najpierw utwórz konta jury w zakładce „Jury i admini”.",
+   tpl_replace="Zastąp bieżącą listę uczestników (zamiast dodawać do niej)",
+   save_update="Zapisz i odśwież dane",
+   upd_h="Zmieniłeś daty, szablon lub uczestników? „Zapisz i odśwież dane” zapisze zmiany w tym samym konkursie (oceny i komentarze zostają) i od razu przeliczy wkład.",
+   tip_th_u="Konto wiki uczestnika",
+   tip_th_b="Suma dodanych bajtów w okresie konkursu",
+   tip_th_e="Liczba edycji / liczba unikalnych stron",
+   tip_th_split="Liczba utworzonych / rozbudowanych artykułów",
+   tip_th_created_n="Ile nowych artykułów utworzył uczestnik",
+   tip_th_expanded_n="Ile istniejących artykułów rozbudował uczestnik",
+   tip_th_avg="Średnia ocena jury: najpierw dla każdego artykułu, potem ze wszystkich artykułów",
+   tip_th_score="Wynik wg formuły konkursu",
+   tip_th_progress="Ile artykułów sprawdzono (dla jury — z przydzielonych tobie)",
+   tip_user_link="Otwórz wkład uczestnika w wiki",
+   tip_quant="Wkład ilościowy: bajty, edycje, artykuły",
+   tip_qual="Analiza jakościowa: oceny jury, postęp sprawdzania, lista artykułów",
+   tip_export="Pobierz tabelę jako CSV",
+   tip_check="Pobierz z wiki aktualny wkład uczestników z okresu konkursu",
+   tip_distribute="Rozdziel artykuły między jury tego konkursu",
+   tip_per_article="Ilu jurorom przydzielić każdy artykuł",
+   tip_reset="Usuń bieżące przydziały i rozdziel od nowa (oceny i komentarze nie są usuwane)",
+   tip_articles_btn="Pokaż artykuły uczestnika",
+   tip_af_all="Wszystkie artykuły uczestnika", tip_af_created="Tylko utworzone artykuły", tip_af_expanded="Tylko rozbudowane artykuły",
+   tip_rf_all="Bez filtra statusu sprawdzenia", tip_rf_todo="Artykuły, których jeszcze nie sprawdziłeś",
+   tip_rf_done="Artykuły, które już sprawdziłeś", tip_rf_mine="Artykuły przydzielone tobie",
+   tip_card="Otwórz artykuł do sprawdzenia",
+   tip_prev="Poprzedni artykuł na liście", tip_next="Następny artykuł na liście", tip_close="Zamknij (Esc)",
+   tip_status="Nie sprawdziłeś jeszcze tego artykułu",
+   tip_unrev="Kliknij, aby usunąć oznaczenie „sprawdzono”",
+   tip_rev_next="Oznacz artykuł jako sprawdzony i otwórz następny",
+   tip_next_btn="Otwórz następny artykuł",
+   tip_my_score="Twoja ocena artykułu (liczba). Wystawienie oceny automatycznie oznacza artykuł jako sprawdzony",
+   tip_comment="Dodaj komentarz do artykułu",
+   tip_tab_article="Pokaż artykuł w oknie", tip_tab_history="Historia edycji artykułu",
+   tip_tab_preview="Krótki opis i obraz z artykułu",
+   tip_tab_c="Tworzenie i edycja konkursów", tip_tab_u="Konta jury i adminów",
+   tip_tab_p="Zmiana twojego hasła",
+   tip_c_name="Nazwa konkursu widoczna dla adminów i jury",
+   tip_projects="Projekty wiki, w których liczy się wkład, jeden link w wierszu",
+   tip_dstart="Edycje sprzed tej daty nie są liczone",
+   tip_dend="Edycje po tej dacie nie są liczone",
+   tip_tpl="Link do szablonu oznaczającego artykuły konkursu. Wkład liczy się tylko w tych artykułach",
+   tip_talk="Włącz, jeśli szablon jest na stronach dyskusji artykułów",
+   tip_tpl_btn="Znajdź artykuły z szablonem i zbierz autorów ich edycji z podanego okresu",
+   tip_replace="Włączone: lista uczestników zostanie zastąpiona znalezionymi. Wyłączone: znalezieni zostaną dodani do bieżącej listy",
+   tip_parts="Nazwy kont wiki uczestników, jedna w wierszu",
+   tip_scope="Które artykuły sprawdza jury: wszystkie, tylko nowe lub tylko rozbudowy",
+   tip_formula="Opcjonalnie. Pusta formuła = nieużywana. Zmienne: bytes, edits, articles, quality, created, expanded",
+   tip_cjury="Którzy członkowie jury pracują przy tym konkursie",
+   tip_save="Zapisz zmiany konkursu",
+   tip_save_update="Zapisz zmiany i od razu przelicz wkład według nowych parametrów",
+   tip_edit="Zmień parametry konkursu bez tworzenia nowego",
+   tip_delete="Usuń konkurs razem ze wszystkimi ocenami i komentarzami",
+   tip_role="Admin konfiguruje system, jury tylko ocenia artykuły",
+   tip_uname="Imię widoczne w komentarzach",
+   tip_ulogin="Login do logowania; dla logowania przez MediaWiki — nazwa konta wiki",
+   tip_upass="Hasło do logowania",
+   tip_create_u="Utwórz konto",
+   tip_del_user="Usuń konto"),
+}
+for _l, _d in _NEW.items():
+    T[_l].update(_d)
 
 def lang():
     l = request.args.get("lang") or session.get("lang") or "uk"
@@ -597,7 +803,7 @@ async function extractParticipants(){
   }
   pbar(bar,pages.length,pages.length,'');
   const ta=document.getElementById('parts');
-  const existing=ta.value.split('\\n').map(s=>s.trim()).filter(Boolean);
+  const existing=document.getElementById('tplReplace').checked?[]:ta.value.split('\\n').map(s=>s.trim()).filter(Boolean);
   ta.value=[...new Set([...existing,...users])].sort((a,b)=>a.localeCompare(b)).join('\\n');
   msg.textContent='✓ '+pages.length+' / '+users.size+(failed?' ('+failed+' сторінок пропущено через помилку)':'');
  }catch(err){msg.textContent='✗ '+err.message}
@@ -610,7 +816,8 @@ const CONTEST={{cjson|safe}};
 let RESULTS={{rjson|safe}}, ASSESS={{ajson|safe}};
 const JURY_LOGIN={{me.login|tojson}};
 const IS_JURY={{(me.role=='jury')|tojson}};
-let QUANT=true,QUAL=false;
+const AUTORUN={{(autorun)|tojson}};
+let QUANT=true,QUAL=IS_JURY;
 const projects=(CONTEST?CONTEST.projects:[]).map(p=>{try{const u=new URL(p);
  return{origin:u.origin,api:u.origin+'/w/api.php',label:u.hostname.replace('.org',''),host:u.hostname}}catch(e){return null}}).filter(Boolean);
 
@@ -868,8 +1075,8 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&MODAL)closeModal()}
 function leftHtml(ex){
  const m=MODAL;
  let h='<div class="md-tabs">';
- [['article',T.tab_article],['history',T.tab_history],['preview',T.tab_preview]].forEach(x=>{
-  h+='<button data-tab="'+x[0]+'" class="'+(MTAB===x[0]?'on':'')+'">'+esc(x[1])+'</button>'});
+ [['article',T.tab_article,T.tip_tab_article],['history',T.tab_history,T.tip_tab_history],['preview',T.tab_preview,T.tip_tab_preview]].forEach(x=>{
+  h+='<button data-tab="'+x[0]+'" title="'+esc(x[2])+'" class="'+(MTAB===x[0]?'on':'')+'">'+esc(x[1])+'</button>'});
  h+='<a class="hint" style="margin-left:auto" target="_blank" rel="noopener" title="'+esc(T.iframe_hint)+'" href="'+esc(articleLink(m.origin,m.title))+'">'+T.open_new+'</a></div>';
  if(MTAB==='preview'){
   h+='<div class="md-pane">';
@@ -915,28 +1122,27 @@ function rightHtml(){
  const idx=modalIdx();
  const cid=idFor(m.user+'||'+m.title);
  let h='<div class="md-top">';
- h+='<button class="btn-s" onclick="stepModal(-1)"'+(idx>0?'':' disabled')+'>‹ '+T.prev+'</button>';
- h+='<button class="btn-s" onclick="stepModal(1)"'+(idx>=0&&idx<CUR_LIST.length-1?'':' disabled')+'>'+T.next+' ›</button>';
+ h+='<button class="btn-s" title="'+esc(T.tip_prev)+'" onclick="stepModal(-1)"'+(idx>0?'':' disabled')+'>‹ '+T.prev+'</button>';
+ h+='<button class="btn-s" title="'+esc(T.tip_next)+'" onclick="stepModal(1)"'+(idx>=0&&idx<CUR_LIST.length-1?'':' disabled')+'>'+T.next+' ›</button>';
  h+='<span class="hint mono">'+(idx>=0?(idx+1)+' / '+CUR_LIST.length:'')+'</span>';
- h+='<button class="btn-s" style="margin-left:auto;padding:4px 10px" onclick="closeModal()">✕</button></div>';
+ h+='<button class="btn-s" style="margin-left:auto;padding:4px 10px" title="'+esc(T.tip_close)+'" onclick="closeModal()">✕</button></div>';
  h+='<h3 style="margin:4px 0 6px">'+esc(m.title)+'</h3>';
  h+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">';
  h+='<span class="chip" style="background:'+(m.created?'#e6f4ea':'var(--acc-soft)')+';color:'+(m.created?'#1d7a4f':'var(--acc)')+'">'+(m.created?T.created:T.expanded)+'</span>';
- h+='<span class="chip '+(rev?'st-ok':'st-todo')+'">'+(rev?'✓ '+T.reviewed:'● '+T.unreviewed)+'</span>';
+ h+='<span class="chip '+(rev?'st-ok':'st-todo')+'"'+(rev&&!legacyDone(m.user)?' style="cursor:pointer" title="'+esc(T.tip_unrev)+'" onclick="toggleReviewed()"':' title="'+esc(T.tip_status)+'"')+'>'+(rev?'✓ '+T.reviewed:'● '+T.unreviewed)+'</span>';
  h+='<span class="hint mono">'+esc(m.label)+' · +'+fmtN(m.bytes)+(LANG==='uk'?' Б':' B')+'</span></div>';
  h+='<div class="hint">'+esc(m.user)+'</div>';
  if((ad.assigned||[]).length)h+='<div class="hint" style="margin-top:4px">'+T.assigned_to+': '+ad.assigned.map(l=>esc(juryName(l))).join(', ')+'</div>';
  h+='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px">';
- h+='<label class="hint" style="font-size:12px">'+T.th_my+':</label>';
- h+='<input type="number" step="0.1" style="width:70px" value="'+(my??'')+'" onchange="saveScoreM(this.value)">';
+ h+='<label class="hint" style="font-size:12px" title="'+esc(T.tip_my_score)+'">'+T.th_my+':</label>';
+ h+='<input type="number" step="0.1" title="'+esc(T.tip_my_score)+'" style="width:70px" value="'+(my??'')+'" onchange="saveScoreM(this.value)">';
  h+='<span class="hint mono">'+T.th_avg+': '+(avg!=null?avg.toFixed(2):'—')+(vals.length?' ('+vals.length+' '+T.scores_n+')':'')+'</span></div>';
  h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">';
- h+='<button class="btn-p" onclick="reviewAndNext()">'+(rev?T.next+' ›':T.rev_next)+'</button>';
- h+=(legacyDone(m.user)?'':'<button class="btn-s" onclick="toggleReviewed()">'+(rev?T.unmark_rev:T.mark_rev)+'</button>')+'</div>';
+ h+='<button class="btn-p" title="'+esc(rev?T.tip_next_btn:T.tip_rev_next)+'" onclick="reviewAndNext()">'+(rev?T.next+' ›':T.rev_next)+'</button></div>';
  h+='<div style="margin-top:14px">';
  (ad.comments||[]).forEach(c=>{h+='<div style="padding:5px 0;border-bottom:1px dashed var(--line)"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span><div>'+esc(c.text)+'</div></div>'});
  if(!(ad.comments||[]).length)h+='<div class="hint" style="font-size:12px">'+T.no_comments+'</div>';
- h+='<div style="display:flex;gap:8px;margin-top:8px"><input class="md-cm" id="cm_'+cid+'" placeholder="'+esc(T.comment_ph)+'" onkeydown="if(event.keyCode===13)saveCommentM()"><button class="btn-p" onclick="saveCommentM()">'+T.save+'</button></div>';
+ h+='<div style="display:flex;gap:8px;margin-top:8px"><input class="md-cm" id="cm_'+cid+'" placeholder="'+esc(T.comment_ph)+'" onkeydown="if(event.keyCode===13)saveCommentM()"><button class="btn-p" title="'+esc(T.tip_comment)+'" onclick="saveCommentM()">'+T.save+'</button></div>';
  h+='</div>';
  return h;
 }
@@ -978,6 +1184,7 @@ function articleQuality(pa,user,allowed){
  return{quality:avgs.length?avgs.reduce((x,y)=>x+y,0)/avgs.length:0,n};
 }
 function evalFormula(f,v){
+ if(!f||!String(f).trim())return null;
  const cleaned=f.replace(/\\b(bytes|edits|articles|quality|created|expanded)\\b/g,'1');
  if(!/^[\\d\\s+\\-*/().,]+$/.test(cleaned))return null;
  try{const fn=new Function('bytes','edits','articles','quality','created','expanded','return ('+f+')');
@@ -1008,6 +1215,7 @@ function render(){
  const oldCar=el.querySelector('.carousel');
  const keepScroll=(oldCar&&!SCROLL_RESET)?oldCar.scrollLeft:0;SCROLL_RESET=false;
  CUR_LIST=[];
+ const HAS_F=!!(CONTEST.formula&&CONTEST.formula.trim());
  const allRows=CONTEST.participants.map(user=>{
   const r=RESULTS?RESULTS[user]:null;const pa=ASSESS[user]||{};
   const{quality,n}=articleQuality(pa,user,(SCOPE!=='all'&&r)?new Set(partTitles(r)):null);
@@ -1018,21 +1226,33 @@ function render(){
   const mineT=titles.filter(t=>isMine(user,t));
   const mineDone=mineT.filter(t=>isReviewed(user,t)).length;
   return{user,r,pa,quality,n,score,sp,total:IS_JURY?mineT.length:titles.length,done:IS_JURY?mineDone:done,mine:mineT.length,mineDone};
- }).sort((x,y)=>QUAL?((y.score??-1e18)-(x.score??-1e18)):((y.r?y.r.bytes:-1)-(x.r?x.r.bytes:-1)));
+ }).sort((x,y)=>(QUAL&&!IS_JURY&&HAS_F)?((y.score??-1e18)-(x.score??-1e18)):((y.r?y.r.bytes:-1)-(x.r?x.r.bytes:-1)));
  const hiddenN=allRows.filter(x=>x.r&&x.r.bytes<MIN_BYTES).length;
  const rows=allRows.filter(x=>!(x.r&&x.r.bytes<MIN_BYTES)&&!(IS_JURY&&QUAL&&x.r&&!x.mine));
  ROWS_CUR=rows;
  const maxB=Math.max(1,...rows.map(r=>r.r?r.r.bytes:0));
- let h='<table><thead><tr><th>#</th><th>'+T.th_u+'</th>';
- if(QUANT){h+='<th>'+T.th_b+'</th>';projects.forEach(p=>h+='<th>'+esc(p.label)+'</th>');h+='<th>'+T.th_e+'</th><th>'+T.th_split+'</th>'}
- if(QUAL)h+='<th>'+T.th_avg+'</th><th>'+T.th_score+'</th><th>'+T.th_progress+'</th>';
+ const th=(lbl,tip)=>'<th title="'+esc(tip||'')+'">'+esc(lbl)+'</th>';
+ let h='<table><thead><tr><th>#</th>'+th(T.th_u,T.tip_th_u);
+ if(IS_JURY){
+  h+=th(T.th_b,T.tip_th_b)+th(T.th_created_n,T.tip_th_created_n)+th(T.th_expanded_n,T.tip_th_expanded_n)+th(T.th_avg,T.tip_th_avg)+th(T.th_progress,T.tip_th_progress);
+ }else{
+  if(QUANT){h+=th(T.th_b,T.tip_th_b);projects.forEach(p=>h+='<th>'+esc(p.label)+'</th>');h+=th(T.th_e,T.tip_th_e)+th(T.th_split,T.tip_th_split)}
+  if(QUAL){h+=th(T.th_avg,T.tip_th_avg);if(HAS_F)h+=th(T.th_score,T.tip_th_score);h+=th(T.th_progress,T.tip_th_progress)}
+ }
  h+='<th></th></tr></thead><tbody>';
  if(!rows.length)h+='<tr><td colspan="99" class="hint" style="padding:20px">'+T.no_parts+'</td></tr>';
  rows.forEach((row,i)=>{
   h+='<tr><td class="mono" style="color:var(--mut)">'+(i+1)+'</td><td>';
-  h+='<a class="wl" target="_blank" rel="noopener" href="'+contribLink(projects[0]?projects[0].origin:'',row.user)+'">'+esc(row.user)+' ↗</a>';
+  h+='<a class="wl" title="'+esc(T.tip_user_link)+'" target="_blank" rel="noopener" href="'+contribLink(projects[0]?projects[0].origin:'',row.user)+'">'+esc(row.user)+' ↗</a>';
   h+='<div style="display:flex;gap:8px">'+projects.map(p=>'<a class="hint" target="_blank" rel="noopener" href="'+contribLink(p.origin,row.user)+'">'+esc(p.label)+' ↗</a>').join('')+'</div></td>';
-  if(QUANT){
+  if(IS_JURY){
+   h+='<td><div class="mono" style="font-weight:700">'+(row.r?'+'+fmtN(row.r.bytes)+(LANG==='uk'?' Б':' B'):'—')+'</div></td>';
+   h+='<td class="mono" style="font-size:12px;color:#1d7a4f">'+(row.r?fmtN(row.sp.created):'—')+'</td>';
+   h+='<td class="mono" style="font-size:12px">'+(row.r?fmtN(row.sp.expanded):'—')+'</td>';
+   h+='<td class="mono">'+(row.n?row.quality.toFixed(2):'—')+'<div class="hint">'+row.n+' '+T.scores_n+'</div></td>';
+   h+='<td class="mono" style="font-size:12px">'+(row.total?row.done+' / '+row.total:'—')+'</td>';
+  }
+  if(QUANT&&!IS_JURY){
    h+='<td><div class="mono" style="font-weight:700">'+(row.r?'+'+fmtN(row.r.bytes)+(LANG==='uk'?' Б':' B'):'—')+'</div>';
    h+='<div class="bar"><i style="width:'+((row.r?row.r.bytes:0)/maxB*100)+'%"></i></div></td>';
    projects.forEach(p=>{const pp=row.r?row.r.perProject[p.host]:null;
@@ -1041,13 +1261,13 @@ function render(){
    h+='<td class="mono" style="font-size:12px">'+(row.r?'<span style="color:#1d7a4f">'+fmtN(row.sp.created)+'</span> / '+fmtN(row.sp.expanded)
     +'<div class="hint">+'+fmtN(row.sp.bc)+' / +'+fmtN(row.sp.be)+'</div>':'—')+'</td>';
   }
-  if(QUAL){
+  if(QUAL&&!IS_JURY){
    h+='<td class="mono">'+(row.n?row.quality.toFixed(2):'—')+'<div class="hint">'+row.n+' '+T.scores_n+'</div></td>';
-   h+='<td><span class="mono" style="font-weight:700;color:var(--gold);font-size:15px">'+(row.score!=null?row.score.toFixed(2):'—')+'</span></td>';
+   if(HAS_F)h+='<td><span class="mono" style="font-weight:700;color:var(--gold);font-size:15px">'+(row.score!=null?row.score.toFixed(2):'—')+'</span></td>';
    h+='<td class="mono" style="font-size:12px">'+(row.total?row.done+' / '+row.total:'—')
     +(row.mine&&!IS_JURY?'<div class="hint">'+T.my_assigned+': '+row.mineDone+' / '+row.mine+'</div>':'')+'</td>';
   }
-  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" onclick="toggleArt('+i+')">'+T.articles_btn+(row.r?' ('+(IS_JURY?row.mine:row.r.articles)+')':'')+'</button>':'')+'</td></tr>';
+  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" title="'+esc(T.tip_articles_btn)+'" onclick="toggleArt('+i+')">'+T.articles_btn+(row.r?' ('+(IS_JURY?row.mine:row.r.articles)+')':'')+'</button>':'')+'</td></tr>';
   if(QUAL&&ARTOPEN===row.user){
    h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:1000px">';
    if(legacyDone(row.user)){
@@ -1076,7 +1296,7 @@ function render(){
     const nC=items.filter(it=>it.created).length,nE=items.length-nC;
     const nDone=items.filter(it=>isReviewed(row.user,it.title)).length;
     const nMine=items.filter(it=>isMine(row.user,it.title)).length;
-    const btn=(cls,f,cur,lbl)=>'<button class="btn-s '+cls+'" data-f="'+f+'" style="padding:3px 10px;font-size:12px'+(cur===f?';background:var(--grad-dark);color:#fff':'')+'">'+esc(lbl)+'</button>';
+    const btn=(cls,f,cur,lbl)=>'<button class="btn-s '+cls+'" data-f="'+f+'" title="'+esc(T['tip_'+(cls==='art-filt-btn'?'af_':'rf_')+f]||'')+'" style="padding:3px 10px;font-size:12px'+(cur===f?';background:var(--grad-dark);color:#fff':'')+'">'+esc(lbl)+'</button>';
     if(SCOPE==='all'){
      h+='<div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">';
      h+=btn('art-filt-btn','all',ART_FILTER,T.filter_all+' ('+items.length+')');
@@ -1113,7 +1333,7 @@ function render(){
       const rv=isReviewed(row.user,it.title),mine=isMine(row.user,it.title);
       const ex=EXTRACT_CACHE[it.host+'::'+it.title];
       const thumbHtml=ex&&ex.thumb?'<img class="thumb" src="'+esc(ex.thumb)+'" alt="">':'<div class="thumb-ph">'+(ex?'—':'…')+'</div>';
-      h+='<div class="art-card" style="'+(rv?'opacity:.72':'')+'" onclick="openIdx('+k+')">';
+      h+='<div class="art-card" title="'+esc(T.tip_card)+'" style="'+(rv?'opacity:.72':'')+'" onclick="openIdx('+k+')">';
       h+=thumbHtml;
       h+='<div class="body"><div class="art-title">'+esc(it.title)+'</div>';
       h+='<div class="hint" style="font-size:10px;margin-top:4px">'+esc(it.label)+' · +'+fmtN(it.bytes)+(LANG==='uk'?' Б':' B')+'</div>';
@@ -1143,16 +1363,16 @@ function render(){
  renderLoad();
  renderModal();
 }
-window.addEventListener('DOMContentLoaded',render);
+window.addEventListener('DOMContentLoaded',()=>{render();if(AUTORUN&&!IS_JURY&&CONTEST)runCheck()});
 </script>
 {% endif %}
 </body></html>"""
 
 ADMIN_TPL = """
 <div class="mode" style="margin-bottom:14px">
- <button class="on" onclick="document.getElementById('sec-c').style.display='block';document.getElementById('sec-u').style.display='none';document.getElementById('sec-p').style.display='none';[...this.parentNode.children].forEach(b=>b.className='');this.className='on'">{{t.tab_c}}</button>
- <button onclick="document.getElementById('sec-c').style.display='none';document.getElementById('sec-u').style.display='block';document.getElementById('sec-p').style.display='none';[...this.parentNode.children].forEach(b=>b.className='');this.className='on'">{{t.tab_u}}</button>
- <button onclick="document.getElementById('sec-c').style.display='none';document.getElementById('sec-u').style.display='none';document.getElementById('sec-p').style.display='block';[...this.parentNode.children].forEach(b=>b.className='');this.className='on'">{{t.tab_p}}</button>
+ <button class="on" onclick="document.getElementById('sec-c').style.display='block';document.getElementById('sec-u').style.display='none';document.getElementById('sec-p').style.display='none';[...this.parentNode.children].forEach(b=>b.className='');this.className='on'" title="{{t.tip_tab_c}}">{{t.tab_c}}</button>
+ <button onclick="document.getElementById('sec-c').style.display='none';document.getElementById('sec-u').style.display='block';document.getElementById('sec-p').style.display='none';[...this.parentNode.children].forEach(b=>b.className='');this.className='on'" title="{{t.tip_tab_u}}">{{t.tab_u}}</button>
+ <button onclick="document.getElementById('sec-c').style.display='none';document.getElementById('sec-u').style.display='none';document.getElementById('sec-p').style.display='block';[...this.parentNode.children].forEach(b=>b.className='');this.className='on'" title="{{t.tip_tab_p}}">{{t.tab_p}}</button>
 </div>
 
 <div id="sec-c" style="display:grid;gap:16px;grid-template-columns:minmax(320px,1fr) minmax(280px,360px)">
@@ -1160,44 +1380,54 @@ ADMIN_TPL = """
   <h3 style="margin-top:0">{{t.edit_c if edit_contest else t.new_c}}</h3>
   <form method="post" action="{{url_for('contest_save')}}">
    <input type="hidden" name="id" value="{{edit_contest.id if edit_contest else ''}}">
-   <label class="lbl">{{t.c_name}}</label>
+   <label class="lbl" title="{{t.tip_c_name}}">{{t.c_name}}</label>
    <input name="name" value="{{edit_contest.name if edit_contest else ''}}" placeholder="Cultural Heritage 2026" required>
-   <label class="lbl">{{t.projects}}</label>
+   <label class="lbl" title="{{t.tip_projects}}">{{t.projects}}</label>
    <textarea name="projects" rows="3" class="mono" style="font-size:12px">{{'\n'.join(edit_contest.projects) if edit_contest else 'https://uk.wikivoyage.org/wiki/Головна_сторінка\nhttps://uk.wikiquote.org/wiki/Головна_сторінка'}}</textarea>
    <div class="hint">{{t.projects_h}}</div>
    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-    <div><label class="lbl">{{t.d_start}}</label><input type="date" id="start" name="start" value="{{edit_contest.start if edit_contest else ''}}"></div>
-    <div><label class="lbl">{{t.d_end}}</label><input type="date" id="end" name="end" value="{{edit_contest.end if edit_contest else ''}}"></div>
+    <div><label class="lbl" title="{{t.tip_dstart}}">{{t.d_start}}</label><input type="date" id="start" name="start" value="{{edit_contest.start if edit_contest else ''}}"></div>
+    <div><label class="lbl" title="{{t.tip_dend}}">{{t.d_end}}</label><input type="date" id="end" name="end" value="{{edit_contest.end if edit_contest else ''}}"></div>
    </div>
    <div style="margin-top:12px;background:var(--acc-soft);border-radius:10px;padding:10px 12px">
-    <label class="lbl" style="margin-top:0">{{t.tpl}}</label>
+    <label class="lbl" style="margin-top:0" title="{{t.tip_tpl}}">{{t.tpl}}</label>
     <input id="tpl" name="template" class="mono" style="font-size:12px"
      value="{{edit_contest.template if edit_contest else ''}}"
      placeholder="https://uk.wikivoyage.org/wiki/Шаблон:Cultural_Heritage_and_Notable_Personalities_2026">
-    <label class="hint" style="display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer">
+    <label class="hint" title="{{t.tip_talk}}" style="display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer">
      <input type="checkbox" id="tplTalkOnly" name="tpl_talk_only" style="width:auto"
       {{'checked' if edit_contest and edit_contest.tpl_talk_only else ''}}> {{t.tpl_talk_only}}
     </label>
     <div style="margin-top:8px;display:flex;gap:10px;align-items:center">
-     <button type="button" id="extbtn" class="btn-p" onclick="extractParticipants()">{{t.tpl_btn}}</button>
+     <button type="button" id="extbtn" class="btn-p" title="{{t.tip_tpl_btn}}" onclick="extractParticipants()">{{t.tpl_btn}}</button>
+     <label class="hint" title="{{t.tip_replace}}" style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="tplReplace" checked style="width:auto"> {{t.tpl_replace}}</label>
      <span id="extmsg" class="hint mono"></span>
     </div>
     <div id="extbar" style="margin-top:6px"></div>
     <div class="hint" style="margin-top:6px">{{t.tpl_h}}</div>
    </div>
-   <label class="lbl">{{t.parts}}</label>
+   <label class="lbl" title="{{t.tip_parts}}">{{t.parts}}</label>
    <textarea id="parts" name="participants" rows="6">{{'\n'.join(edit_contest.participants) if edit_contest else ''}}</textarea>
-   <label class="lbl">{{t.review_scope}}</label>
+   <label class="lbl" title="{{t.tip_scope}}">{{t.review_scope}}</label>
    <select name="review_scope">
     {% for k in ['all','created','expanded'] %}<option value="{{k}}" {{'selected' if (edit_contest.review_scope if edit_contest else 'all')==k else ''}}>{{t['scope_'~k]}}</option>{% endfor %}
    </select>
    <div class="hint">{{t.scope_h}}</div>
-   <label class="lbl">{{t.formula}}</label>
-   <input name="formula" class="mono" value="{{edit_contest.formula if edit_contest else 'bytes / 1000 + quality * 10'}}">
+   <label class="lbl" title="{{t.tip_cjury}}">{{t.contest_jury}}</label>
+   <div style="display:flex;flex-wrap:wrap;gap:6px 14px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#fff">
+    {% for u in users if u.role=='jury' %}
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px" title="{{t.tip_cjury}}"><input type="checkbox" name="jury" value="{{u.login}}" style="width:auto" {{'checked' if edit_contest and u.login in (edit_contest.jury or []) else ''}}> {{u.name}} <span class="mono hint">({{u.login}})</span></label>
+    {% else %}<span class="hint">{{t.no_jury_accounts}}</span>{% endfor %}
+   </div>
+   <div class="hint">{{t.contest_jury_h}}</div>
+   <label class="lbl" title="{{t.tip_formula}}">{{t.formula}}</label>
+   <input name="formula" class="mono" title="{{t.tip_formula}}" placeholder="bytes / 1000 + quality * 10" value="{{(edit_contest.formula or '') if edit_contest else ''}}">
    <div class="hint">{{t.formula_h}}</div>
    {% if msg %}<div style="color:var(--ok);font-weight:600;margin-top:8px">{{msg}}</div>{% endif %}
-   <div style="display:flex;gap:8px;margin-top:14px">
-    <button class="btn-p">{{t.save if edit_contest else t.create}}</button>
+   {% if edit_contest %}<div class="hint" style="margin-top:10px">{{t.upd_h}}</div>{% endif %}
+   <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+    <button class="btn-p" title="{{t.tip_save}}">{{t.save if edit_contest else t.create}}</button>
+    {% if edit_contest %}<button class="btn-p" name="after" value="check" title="{{t.tip_save_update}}">{{t.save_update}}</button>{% endif %}
     {% if edit_contest %}<a href="?view=admin" class="btn-s" style="text-decoration:none;padding:8px 14px">{{t.cancel}}</a>{% endif %}
    </div>
   </form>
@@ -1208,13 +1438,13 @@ ADMIN_TPL = """
   {% for c in contests %}
   <div style="border-bottom:1px solid var(--line);padding:10px 0">
    <div style="font-weight:700">{{c.name}}</div>
-   <div class="hint">{{c.hosts}} · {{t.parts_n}}: {{c.participants|length}}</div>
+   <div class="hint">{{c.hosts}} · {{t.parts_n}}: {{c.participants|length}} · {{t.jury}}: {{c.jury|length}}</div>
    <div class="mono hint">{{c.formula}}</div>
    <div style="display:flex;gap:6px;margin-top:4px">
-    <a class="btn-s" style="padding:4px 10px;font-size:12px;text-decoration:none" href="?view=admin&edit={{c.id}}">{{t.edit}}</a>
+    <a class="btn-s" style="padding:4px 10px;font-size:12px;text-decoration:none" title="{{t.tip_edit}}" href="?view=admin&edit={{c.id}}">{{t.edit}}</a>
     <form method="post" action="{{url_for('contest_delete')}}" style="margin:0">
      <input type="hidden" name="id" value="{{c.id}}">
-     <button class="btn-d" style="padding:4px 10px;font-size:12px">{{t.delete}}</button></form>
+     <button class="btn-d" title="{{t.tip_delete}}" style="padding:4px 10px;font-size:12px">{{t.delete}}</button></form>
    </div>
   </div>
   {% endfor %}
@@ -1225,12 +1455,12 @@ ADMIN_TPL = """
  <div style="display:grid;gap:16px;grid-template-columns:minmax(300px,420px) 1fr">
   <div class="card"><h3 style="margin-top:0">{{t.add_u}}</h3>
    <form method="post" action="{{url_for('user_save')}}">
-    <label class="lbl">{{t.role}}</label>
+    <label class="lbl" title="{{t.tip_role}}">{{t.role}}</label>
     <select name="role"><option value="jury">{{t.jury}}</option><option value="admin">{{t.admin}}</option></select>
-    <label class="lbl">{{t.u_name}}</label><input name="name">
-    <label class="lbl">{{t.login}}</label><input name="login" required>
-    <label class="lbl">{{t.password}}</label><input name="password" type="password" required>
-    <button class="btn-p" style="margin-top:12px">{{t.create}}</button>
+    <label class="lbl" title="{{t.tip_uname}}">{{t.u_name}}</label><input name="name">
+    <label class="lbl" title="{{t.tip_ulogin}}">{{t.login}}</label><input name="login" required>
+    <label class="lbl" title="{{t.tip_upass}}">{{t.password}}</label><input name="password" type="password" required>
+    <button class="btn-p" title="{{t.tip_create_u}}" style="margin-top:12px">{{t.create}}</button>
    </form></div>
   <div class="card"><h3 style="margin-top:0">{{t.accounts}} ({{users|length}})</h3>
    {% for u in users %}
@@ -1240,7 +1470,7 @@ ADMIN_TPL = """
     {% if u.login!=me.login %}
     <form method="post" action="{{url_for('user_delete')}}" style="margin-left:auto">
      <input type="hidden" name="login" value="{{u.login}}">
-     <button class="btn-d" style="padding:3px 10px;font-size:12px">{{t.delete}}</button></form>
+     <button class="btn-d" title="{{t.tip_del_user}}" style="padding:3px 10px;font-size:12px">{{t.delete}}</button></form>
     {% else %}<span class="hint" style="margin-left:auto">{{t.its_you}}</span>{% endif %}
    </div>{% endfor %}</div>
  </div>
@@ -1261,19 +1491,21 @@ ANALYSIS_TPL = """
  <div class="card hint">{{t.no_c}}</div>
 {% else %}
 <div class="card" style="display:flex;flex-wrap:wrap;gap:14px;align-items:center">
+ {% if me.role=='admin' %}
  <div>
   <div class="lbl" style="margin:0">{{t.mode}}</div>
   <div class="mode" style="margin-top:4px">
-   <button id="mq" class="on" onclick="setMode('quant')">{{t.quant}}</button>
-   <button id="ml" onclick="setMode('qual')">{{t.qual}}</button>
+   <button id="mq" class="on" title="{{t.tip_quant}}" onclick="setMode('quant')">{{t.quant}}</button>
+   <button id="ml" title="{{t.tip_qual}}" onclick="setMode('qual')">{{t.qual}}</button>
   </div>
   <div id="modehint" class="hint" style="margin-top:4px">{{t.modes_h}}</div>
  </div>
+ {% endif %}
  <div style="margin-left:auto;text-align:right;min-width:280px">
   <div style="display:flex;gap:8px;justify-content:flex-end">
-   <a id="csvlink" class="btn-s" style="text-decoration:none;padding:8px 14px" href="/export/{{cid}}.csv?quant=1&qual=0">{{t.export}}</a>
+   <a id="csvlink" title="{{t.tip_export}}" class="btn-s" style="text-decoration:none;padding:8px 14px" href="/export/{{cid}}.csv?quant=1&qual=0">{{t.export}}</a>
    {% if me.role=='admin' %}
-   <button id="runbtn" class="btn-p" onclick="runCheck()">{{t.check}}</button>
+   <button id="runbtn" class="btn-p" title="{{t.tip_check}}" onclick="runCheck()">{{t.check}}</button>
    {% else %}
    <span class="hint" style="align-self:center;font-size:11px;max-width:200px;text-align:right">{{t.jury_no_check}}</span>
    {% endif %}
@@ -1287,9 +1519,9 @@ ANALYSIS_TPL = """
    {% if me.role=='admin' %}<div class="hint">{{t.distribute_h}}</div>{% endif %}</div>
   {% if me.role=='admin' %}
   <div style="margin-left:auto;display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
-   <div><label class="lbl" style="margin:0 0 2px">{{t.per_article}}</label><input id="distPer" type="number" min="1" value="1" style="width:70px"></div>
-   <label class="hint" style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><input type="checkbox" id="distReset" style="width:auto"> {{t.reset_dist}}</label>
-   <button class="btn-p" onclick="runDistribute()">{{t.distribute}}</button>
+   <div><label class="lbl" style="margin:0 0 2px">{{t.per_article}}</label><input id="distPer" title="{{t.tip_per_article}}" type="number" min="1" value="1" style="width:70px"></div>
+   <label class="hint" title="{{t.tip_reset}}" style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><input type="checkbox" id="distReset" style="width:auto"> {{t.reset_dist}}</label>
+   <button class="btn-p" title="{{t.tip_distribute}}" onclick="runDistribute()">{{t.distribute}}</button>
   </div>
   {% endif %}
  </div>
@@ -1297,7 +1529,7 @@ ANALYSIS_TPL = """
  <div id="loadtbl" style="margin-top:8px"></div>
 </div>
 <div class="card" style="padding:0;overflow-x:auto"><div id="tbl"></div></div>
-<div class="hint">{{t.f_of}} <span class="chip">{{contest.formula if contest.formula else '—'}}</span> · {{t.scope_label}} <span class="chip">{{t['scope_'~(contest.review_scope or 'all')]}}</span></div>
+<div class="hint">{% if me.role=='admin' %}{{t.f_of}} <span class="chip">{{contest.formula if contest.formula else '—'}}</span> · {% endif %}{{t.scope_label}} <span class="chip">{{t['scope_'~(contest.review_scope or 'all')]}}</span></div>
 {% endif %}
 {% if me.role=='jury' %}
 <div class="card" style="max-width:400px;margin-top:14px">
@@ -1314,6 +1546,9 @@ ANALYSIS_TPL = """
 # ── Допоміжне ────────────────────────────────────────────────
 def get_contests():
     rows = db().execute("SELECT * FROM contests").fetchall()
+    cj = {}
+    for r in db().execute("SELECT contest_id, login FROM contest_jury ORDER BY login"):
+        cj.setdefault(r["contest_id"], []).append(r["login"])
     out = []
     for r in rows:
         c = dict(r)
@@ -1325,6 +1560,7 @@ def get_contests():
             if m:
                 hosts.append(m.group(1).replace(".org", ""))
         c["hosts"] = " · ".join(hosts)
+        c["jury"] = cj.get(c["id"], [])
         out.append(c)
     return out
 
@@ -1417,6 +1653,16 @@ def article_quality(participant_assess, legacy=None, allowed=None):
 class D(dict):
     __getattr__ = dict.get
 
+def contest_access(cid):
+    """Адмін бачить усі конкурси; журі — лише ті, до яких його додано."""
+    u = session.get("user")
+    if not u:
+        return False
+    if u["role"] == "admin":
+        return True
+    return db().execute("SELECT 1 FROM contest_jury WHERE contest_id=? AND login=?",
+                        (cid, u["login"])).fetchone() is not None
+
 # ── Маршрути ─────────────────────────────────────────────────
 @app.route("/login", methods=["GET", "POST"])
 def login_view():
@@ -1477,6 +1723,8 @@ def index():
     l = lang()
     me = D(session["user"])
     contests = [D(c) for c in get_contests()]
+    if me.role != "admin":
+        contests = [c for c in contests if me.login in (c.jury or [])]
     cid = request.args.get("contest") or (contests[0].id if contests else None)
     contest = next((c for c in contests if c.id == cid), None)
     view = request.args.get("view", "analysis")
@@ -1498,11 +1746,14 @@ def index():
         tpl, t=D(T[l]), l=l, me=me, contests=contests, cid=cid, contest=contest,
         view=view, edit_contest=edit_contest, users=users,
         msg=request.args.get("msg"),
+        autorun=(request.args.get("autorun") == "1" and me.role == "admin"),
         tjson=json.dumps(T[l], ensure_ascii=False),
-        cjson=json.dumps(contest, ensure_ascii=False) if contest else "null",
+        cjson=json.dumps({k: v for k, v in contest.items() if me.role == "admin" or k != "jury"},
+                         ensure_ascii=False) if contest else "null",
         rjson=json.dumps(results, ensure_ascii=False) if results else "null",
         ajson=json.dumps(assess, ensure_ascii=False), min_bytes=MIN_BYTES,
-        juryjson=json.dumps([{"login": u.login, "name": u.name, "role": u.role} for u in users
+        juryjson=json.dumps([{"login": u.login, "name": u.name, "role": u.role,
+                              "inc": u.login in ((contest.jury or []) if contest else [])} for u in users
                              if me.role == "admin" or u.login == me.login],
                             ensure_ascii=False).replace("</", "<\\/"),
         ljson=json.dumps(get_legacy(contest.id) if contest else {},
@@ -1516,7 +1767,7 @@ def contest_save():
     participants = [s.strip() for s in f.get("participants", "").splitlines() if s.strip()]
     formula = f.get("formula", "").strip()
     if formula and not validate_formula(formula):
-        formula = "bytes / 1000 + quality * 10"  # некоректну підміняємо; порожню залишаємо порожньою
+        formula = ""  # некоректну формулу не зберігаємо; порожня = формула не використовується
     cid = f.get("id") or "c" + hex(int(time.time() * 1000))[2:]
     scope = f.get("review_scope") if f.get("review_scope") in ("all", "created", "expanded") else "all"
     db().execute("""INSERT INTO contests VALUES(?,?,?,?,?,?,?,?,?,?)
@@ -1527,7 +1778,23 @@ def contest_save():
         (cid, f.get("name", "").strip(), f.get("template", "").strip(),
          json.dumps(projects), json.dumps(participants), formula,
          f.get("start", ""), f.get("end", ""), 1 if f.get("tpl_talk_only") else 0, scope))
+    # журі конкурсу: оновлюємо лише склад; оцінки, перевірки та призначення не чіпаємо
+    valid = {r["login"] for r in db().execute("SELECT login FROM users WHERE role='jury'")}
+    chosen = [j for j in f.getlist("jury") if j in valid]
+    db().execute("DELETE FROM contest_jury WHERE contest_id=?", (cid,))
+    db().executemany("INSERT OR IGNORE INTO contest_jury VALUES(?,?)", [(cid, j) for j in chosen])
+    # з кешу внеску прибираємо учасників, яких більше немає у списку (оцінки не видаляємо)
+    rr = db().execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
+    if rr:
+        old = json.loads(rr["data"]) or {}
+        keep = set(participants)
+        kept = {k: v for k, v in old.items() if k in keep}
+        if len(kept) != len(old):
+            db().execute("UPDATE results SET data=? WHERE contest_id=?",
+                         (json.dumps(kept, ensure_ascii=False), cid))
     db().commit()
+    if f.get("after") == "check":
+        return redirect(url_for("index", view="analysis", contest=cid, autorun=1))
     return redirect(url_for("index", view="admin", contest=cid, msg=T[lang()]["saved"]))
 
 @app.route("/admin/contest/delete", methods=["POST"])
@@ -1535,7 +1802,7 @@ def contest_save():
 def contest_delete():
     cid = request.form["id"]
     for tbl in ("contests", "results", "scores", "comments", "article_scores",
-                "article_comments", "article_reviews", "article_assignments"):
+                "article_comments", "article_reviews", "article_assignments", "contest_jury"):
         db().execute(f"DELETE FROM {tbl} WHERE {'id' if tbl=='contests' else 'contest_id'}=?", (cid,))
     db().commit()
     return redirect(url_for("index", view="admin"))
@@ -1558,6 +1825,7 @@ def user_save():
 def user_delete():
     if request.form["login"] != session["user"]["login"]:
         db().execute("DELETE FROM users WHERE login=?", (request.form["login"],))
+        db().execute("DELETE FROM contest_jury WHERE login=?", (request.form["login"],))
         db().commit()
     return redirect(url_for("index", view="admin"))
 
@@ -1575,6 +1843,8 @@ def change_password():
 @app.route("/api/results/<cid>", methods=["POST"])
 @login_required
 def api_results(cid):
+    if session["user"]["role"] != "admin":
+        return jsonify(error="forbidden"), 403
     db().execute("""INSERT INTO results VALUES(?,?,?)
         ON CONFLICT(contest_id) DO UPDATE SET data=excluded.data,updated=excluded.updated""",
         (cid, json.dumps(request.get_json(), ensure_ascii=False), int(time.time())))
@@ -1585,6 +1855,8 @@ def api_results(cid):
 @login_required
 def api_score():
     d = request.get_json()
+    if not contest_access(d["contest"]):
+        return jsonify(error="forbidden"), 403
     article = d.get("article", "")
     me = session["user"]["login"]
     if d.get("value") is None:
@@ -1604,6 +1876,8 @@ def api_score():
 @login_required
 def api_review():
     d = request.get_json()
+    if not contest_access(d["contest"]):
+        return jsonify(error="forbidden"), 403
     key = (d["contest"], d["participant"], d.get("article", ""), session["user"]["login"])
     if d.get("reviewed"):
         db().execute("INSERT OR IGNORE INTO article_reviews VALUES(?,?,?,?)", key)
@@ -1617,6 +1891,8 @@ def api_review():
 @login_required
 def api_comment():
     d = request.get_json()
+    if not contest_access(d["contest"]):
+        return jsonify(error="forbidden"), 403
     db().execute("INSERT INTO article_comments(contest_id,participant,article,jury_name,text,date) VALUES(?,?,?,?,?,?)",
                  (d["contest"], d["participant"], d.get("article", ""), session["user"]["name"],
                   d["text"][:2000], time.strftime("%Y-%m-%d %H:%M")))
@@ -1654,7 +1930,8 @@ def api_distribute(cid):
     if not items:
         return jsonify(error="no_results"), 400
     pool = [r["login"] for r in con.execute(
-        "SELECT login FROM users WHERE role='jury' ORDER BY login")]
+        "SELECT cj.login FROM contest_jury cj JOIN users u ON u.login=cj.login "
+        "WHERE cj.contest_id=? AND u.role='jury' ORDER BY cj.login", (cid,))]
     if not pool:
         return jsonify(error="no_jury"), 400
     try:
@@ -1692,6 +1969,8 @@ def api_distribute(cid):
 @app.route("/api/state/<cid>")
 @login_required
 def api_state(cid):
+    if not contest_access(cid):
+        return jsonify(error="forbidden"), 403
     return jsonify(assess=get_assess(cid, None if session["user"]["role"] == "admin"
                                      else session["user"]["login"]))
 
@@ -1706,11 +1985,14 @@ def export_csv(cid):
     contest = next((c for c in get_contests() if c["id"] == cid), None)
     if not contest:
         return "Not found", 404
+    if not contest_access(cid):
+        return "Forbidden", 403
     rr = db().execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
     results = json.loads(rr["data"]) if rr else {}
     assess = get_assess(cid)
     legacy = get_legacy(cid)
     scope = contest.get("review_scope") or "all"
+    show_score = bool((contest.get("formula") or "").strip()) and session["user"]["role"] == "admin"
     hosts = []
     for p in contest["projects"]:
         m = re.match(r"https?://([^/]+)", p)
@@ -1747,7 +2029,7 @@ def export_csv(cid):
     if quant:
         head += [t["th_b"]] + hosts + [t["th_e"], t["th_split"], t["th_split_b"]]
     if qual:
-        head += [t["th_avg"], t["th_score"], t["comments"]]
+        head += [t["th_avg"]] + ([t["th_score"]] if show_score else []) + [t["comments"]]
     w.writerow(head)
     for i, (user, r, all_comments, quality, n, score) in enumerate(rows, 1):
         line = [i, user]
@@ -1761,9 +2043,10 @@ def export_csv(cid):
             line.append(f"{sp['created']} / {sp['expanded']}" if sp else "")
             line.append(f"{sp['bc']} / {sp['be']}" if sp else "")
         if qual:
-            line += [round(quality, 2) if n else "",
-                     round(score, 2) if score is not None else "",
-                     " | ".join(all_comments)]
+            line.append(round(quality, 2) if n else "")
+            if show_score:
+                line.append(round(score, 2) if score is not None else "")
+            line.append(" | ".join(all_comments))
         w.writerow(line)
     safe = re.sub(r"[^\w \-]", "", contest["name"], flags=re.U).strip().replace(" ", "_") or "contest"
     ascii_fallback = re.sub(r"[^A-Za-z0-9_\-]", "", safe)
