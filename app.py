@@ -354,6 +354,8 @@ _NEW = {
  "uk": dict(
    th_created_n="Створено", th_expanded_n="Доповнено",
    formula="Формула ранжування для журі (необов'язково — залиште порожнім, якщо не потрібна)",
+   parts_saved="Список учасників збережено", parts_not_saved="НЕ збережено — натисніть «Зберегти»", parts_save_hint="Щоб список зберігся, натисніть «Створити»",
+   reassign_title="Перепризначити неперевірені статті", reassign_h="Передає лише ті неперевірені статті, що призначені вибраному журі, іншому члену журі. Перевірені статті, оцінки та коментарі лишаються без змін.", reassign_from="Від кого", reassign_to="Кому", reassign_btn="Перепризначити", tip_reassign="Передати неперевірені статті одного журі іншому. Перевірені, оцінки й коментарі не змінюються", reassign_pick="Оберіть обох членів журі", reassign_same="Оберіть різних членів журі", reassign_none="Немає неперевірених статей для передачі", reassign_confirm="Передати неперевірених статей: {n}? Перевірені статті ({k}) залишаться у попереднього журі, оцінки й коментарі не змінюються.", reassign_done="Передано статей",
    contest_jury="Журі цього конкурсу",
    contest_jury_h="Лише ці члени журі бачитимуть конкурс і отримуватимуть статті на перевірку. Уже виставлені оцінки та позначки не видаляються.",
    no_jury_accounts="Спершу створіть облікові записи журі у вкладці «Журі та адміни».",
@@ -418,6 +420,8 @@ _NEW = {
  "en": dict(
    th_created_n="Created", th_expanded_n="Expanded",
    formula="Ranking formula for the jury (optional — leave empty if not needed)",
+   parts_saved="Participant list saved", parts_not_saved="NOT saved — click “Save”", parts_save_hint="Click “Create” to keep this list",
+   reassign_title="Reassign unreviewed articles", reassign_h="Moves only the unreviewed articles assigned to the selected juror to another juror. Reviewed articles, scores and comments stay unchanged.", reassign_from="From", reassign_to="To", reassign_btn="Reassign", tip_reassign="Move unreviewed articles from one juror to another. Reviewed articles, scores and comments are not changed", reassign_pick="Choose both jurors", reassign_same="Choose different jurors", reassign_none="No unreviewed articles to move", reassign_confirm="Move {n} unreviewed articles? Reviewed articles ({k}) stay with the previous juror; scores and comments are not changed.", reassign_done="Articles moved",
    contest_jury="Jury of this contest",
    contest_jury_h="Only these jury members will see the contest and receive articles to review. Existing scores and marks are not deleted.",
    no_jury_accounts="First create jury accounts in the “Jury & admins” tab.",
@@ -482,6 +486,8 @@ _NEW = {
  "pl": dict(
    th_created_n="Utworzone", th_expanded_n="Rozbudowane",
    formula="Formuła rankingowa dla jury (opcjonalnie — zostaw puste, jeśli niepotrzebna)",
+   parts_saved="Lista uczestników zapisana", parts_not_saved="NIE zapisano — kliknij „Zapisz”", parts_save_hint="Kliknij „Utwórz”, aby zachować listę",
+   reassign_title="Przydziel ponownie niesprawdzone artykuły", reassign_h="Przenosi tylko niesprawdzone artykuły wybranego jurora do innego jurora. Sprawdzone artykuły, oceny i komentarze zostają bez zmian.", reassign_from="Od kogo", reassign_to="Komu", reassign_btn="Przydziel ponownie", tip_reassign="Przenieś niesprawdzone artykuły jednego jurora do innego. Sprawdzone, oceny i komentarze nie są zmieniane", reassign_pick="Wybierz obu jurorów", reassign_same="Wybierz różnych jurorów", reassign_none="Brak niesprawdzonych artykułów do przeniesienia", reassign_confirm="Przenieść niesprawdzone artykuły: {n}? Sprawdzone artykuły ({k}) zostają u poprzedniego jurora; oceny i komentarze nie są zmieniane.", reassign_done="Przeniesiono artykułów",
    contest_jury="Jury tego konkursu",
    contest_jury_h="Tylko ci członkowie jury zobaczą konkurs i dostaną artykuły do sprawdzenia. Wystawione oceny i oznaczenia nie są usuwane.",
    no_jury_accounts="Najpierw utwórz konta jury w zakładce „Jury i admini”.",
@@ -806,6 +812,15 @@ async function extractParticipants(){
   const existing=document.getElementById('tplReplace').checked?[]:ta.value.split('\\n').map(s=>s.trim()).filter(Boolean);
   ta.value=[...new Set([...existing,...users])].sort((a,b)=>a.localeCompare(b)).join('\\n');
   msg.textContent='✓ '+pages.length+' / '+users.size+(failed?' ('+failed+' сторінок пропущено через помилку)':'');
+  const cidEl=document.querySelector('form input[name=id]'),cidV=cidEl?cidEl.value:'';
+  if(cidV){
+   try{
+    const list=ta.value.split('\\n').map(x=>x.trim()).filter(Boolean);
+    const rs=await fetch('/api/contest/'+encodeURIComponent(cidV)+'/participants',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({participants:list})});
+    if(!rs.ok)throw new Error(rs.status);
+    msg.textContent+=' · '+T.parts_saved+' ('+list.length+')';
+   }catch(e2){msg.textContent+=' · ⚠ '+T.parts_not_saved}
+  }else msg.textContent+=' · '+T.parts_save_hint;
  }catch(err){msg.textContent='✗ '+err.message}
  btn.disabled=false;
 }
@@ -956,6 +971,24 @@ async function runDistribute(){
   if(!r.ok||d.error){msg.textContent='✗ '+(T[d.error]||d.error||r.status);return}
   await reloadState();render();
   msg.textContent='✓ '+T.dist_done+': '+d.items;
+ }catch(e){msg.textContent='✗ '+e.message}
+}
+async function runReassign(){
+ const from=document.getElementById('reFrom').value,to=document.getElementById('reTo').value;
+ const msg=document.getElementById('distmsg');
+ if(!from||!to){msg.textContent='✗ '+T.reassign_pick;return}
+ if(from===to){msg.textContent='✗ '+T.reassign_same;return}
+ const call=async dry=>{const r=await fetch('/api/reassign/'+CID,{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({from:from,to:to,dry:dry})});const d=await r.json();
+  if(!r.ok||d.error)throw new Error(T[d.error]||d.error||r.status);return d};
+ try{
+  msg.textContent=T.loading;
+  const p=await call(true);
+  if(!p.movable){msg.textContent=T.reassign_none+(p.kept?' ('+p.kept+')':'');return}
+  if(!confirm(T.reassign_confirm.replace('{n}',p.movable).replace('{k}',p.kept))){msg.textContent='';return}
+  const d=await call(false);
+  await reloadState();render();
+  msg.textContent='✓ '+T.reassign_done+': '+(d.moved+d.merged)+' — '+juryName(from)+' → '+juryName(to);
  }catch(e){msg.textContent='✗ '+e.message}
 }
 function renderLoad(){
@@ -1525,6 +1558,19 @@ ANALYSIS_TPL = """
   </div>
   {% endif %}
  </div>
+ {% if me.role=='admin' %}
+ <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+  <div class="lbl" style="margin:0" title="{{t.tip_reassign}}">{{t.reassign_title}}</div>
+  <div class="hint">{{t.reassign_h}}</div>
+  <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-top:6px">
+   <div><label class="lbl" style="margin:0 0 2px">{{t.reassign_from}}</label>
+    <select id="reFrom" title="{{t.tip_reassign}}"><option value=""></option>{% for u in users if u.role=='jury' %}<option value="{{u.login}}">{{u.name}} ({{u.login}})</option>{% endfor %}</select></div>
+   <div><label class="lbl" style="margin:0 0 2px">{{t.reassign_to}}</label>
+    <select id="reTo" title="{{t.tip_reassign}}"><option value=""></option>{% for u in users if u.role=='jury' and u.login in (contest.jury or []) %}<option value="{{u.login}}">{{u.name}} ({{u.login}})</option>{% endfor %}</select></div>
+   <button class="btn-p" title="{{t.tip_reassign}}" onclick="runReassign()">{{t.reassign_btn}}</button>
+  </div>
+ </div>
+ {% endif %}
  <div id="distmsg" class="hint mono" style="margin-top:6px"></div>
  <div id="loadtbl" style="margin-top:8px"></div>
 </div>
@@ -1840,6 +1886,27 @@ def change_password():
     return redirect(url_for("index", view="admin"))
 
 # ── API для фронтенду ────────────────────────────────────────
+@app.route("/api/contest/<cid>/participants", methods=["POST"])
+@login_required
+def api_set_participants(cid):
+    """Зберігає список учасників наявного конкурсу (без створення нового); оцінки не чіпає."""
+    if session["user"]["role"] != "admin":
+        return jsonify(error="forbidden"), 403
+    if not db().execute("SELECT 1 FROM contests WHERE id=?", (cid,)).fetchone():
+        return jsonify(error="not_found"), 404
+    names = (request.get_json() or {}).get("participants") or []
+    participants = list(dict.fromkeys(str(x).strip() for x in names if str(x).strip()))
+    db().execute("UPDATE contests SET participants=? WHERE id=?",
+                 (json.dumps(participants, ensure_ascii=False), cid))
+    rr = db().execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
+    if rr:
+        keep = set(participants)
+        old = json.loads(rr["data"]) or {}
+        db().execute("UPDATE results SET data=? WHERE contest_id=?",
+                     (json.dumps({k: v for k, v in old.items() if k in keep}, ensure_ascii=False), cid))
+    db().commit()
+    return jsonify(ok=True, count=len(participants))
+
 @app.route("/api/results/<cid>", methods=["POST"])
 @login_required
 def api_results(cid):
@@ -1965,6 +2032,70 @@ def api_distribute(cid):
             load[j] += 1
     con.commit()
     return jsonify(ok=True, items=len(items), load=load)
+
+@app.route("/api/reassign/<cid>", methods=["POST"])
+@login_required
+def api_reassign(cid):
+    """Передає НЕПЕРЕВІРЕНІ статті одного журі іншому (лише адмін).
+    Перевірені статті, оцінки, коментарі та позначки не змінюються."""
+    if session["user"]["role"] != "admin":
+        return jsonify(error="forbidden"), 403
+    d = request.get_json(silent=True) or {}
+    src, dst = d.get("from"), d.get("to")
+    con = db()
+    if not src or not dst or src == dst:
+        return jsonify(error="bad_request"), 400
+    ok = {r["login"] for r in con.execute(
+        "SELECT cj.login FROM contest_jury cj JOIN users u ON u.login=cj.login "
+        "WHERE cj.contest_id=? AND u.role='jury'", (cid,))}
+    if dst not in ok:
+        return jsonify(error="bad_request"), 400
+    if not con.execute("SELECT 1 FROM users WHERE login=? AND role='jury'", (src,)).fetchone():
+        return jsonify(error="bad_request"), 400
+    nm = con.execute("SELECT name FROM users WHERE login=?", (src,)).fetchone()
+    src_name = (nm["name"] if nm else None) or src
+    # що вже зроблено джерелом: перевірки, оцінки, коментарі (статті) та оцінки/коментарі рівня учасника
+    done = set()
+    for r in con.execute("SELECT participant, article FROM article_reviews "
+                         "WHERE contest_id=? AND jury=?", (cid, src)):
+        done.add((r["participant"], r["article"]))
+    for r in con.execute("SELECT participant, article FROM article_scores "
+                         "WHERE contest_id=? AND jury=?", (cid, src)):
+        done.add((r["participant"], r["article"]))
+    for r in con.execute("SELECT participant, article FROM article_comments "
+                         "WHERE contest_id=? AND jury_name=?", (cid, src_name)):
+        done.add((r["participant"], r["article"]))
+    legacy_users = set()
+    for r in con.execute("SELECT participant FROM scores WHERE contest_id=? AND jury=? "
+                         "AND value IS NOT NULL", (cid, src)):
+        legacy_users.add(r["participant"])
+    for r in con.execute("SELECT participant FROM comments WHERE contest_id=? AND jury_name=?",
+                         (cid, src_name)):
+        legacy_users.add(r["participant"])
+    rows = con.execute("SELECT participant, article FROM article_assignments "
+                       "WHERE contest_id=? AND jury=?", (cid, src)).fetchall()
+    movable, kept = [], 0
+    for r in rows:
+        k = (r["participant"], r["article"])
+        if k in done or r["participant"] in legacy_users:
+            kept += 1
+        else:
+            movable.append(k)
+    if d.get("dry"):
+        return jsonify(ok=True, movable=len(movable), kept=kept)
+    moved = merged = 0
+    for p, a in movable:
+        has = con.execute("SELECT 1 FROM article_assignments WHERE contest_id=? AND participant=? "
+                          "AND article=? AND jury=?", (cid, p, a, dst)).fetchone()
+        if has:
+            merged += 1  # ця стаття вже призначена одержувачу — просто знімаємо з джерела
+        else:
+            con.execute("INSERT INTO article_assignments VALUES(?,?,?,?)", (cid, p, a, dst))
+            moved += 1
+        con.execute("DELETE FROM article_assignments WHERE contest_id=? AND participant=? "
+                    "AND article=? AND jury=?", (cid, p, a, src))
+    con.commit()
+    return jsonify(ok=True, moved=moved, merged=merged, kept=kept)
 
 @app.route("/api/state/<cid>")
 @login_required
