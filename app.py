@@ -1,2193 +1,708 @@
-# -*- coding: utf-8 -*-
-"""
-WikiRank / ВікіРанг — аналіз внеску учасників вікіконкурсів.
-Версія для Wikimedia Toolforge (Flask + SQLite).
-
-Ролі: admin (налаштування) та jury (оцінювання).
-Кількісний внесок і витягування учасників із шаблону виконуються
-у браузері напряму через API MediaWiki (CORS origin=*), а результати
-зберігаються на сервері. Мови інтерфейсу: uk / en.
-"""
-import ast
-import csv
-import io
-import json
-import operator
-import os
-import random
-import re
-import sqlite3
-import time
-from functools import wraps
-from urllib.parse import quote
-
-from flask import (Flask, g, jsonify, redirect, render_template_string,
-                   request, session, url_for, Response)
-from werkzeug.security import check_password_hash, generate_password_hash
-
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(32)
-
-# ── OAuth через MediaWiki (Вікімедіа) — опційно, поряд зі звичайним логіном ──
-try:
-    import mwoauth
-except ImportError:
-    mwoauth = None
-OAUTH_MWURI = "https://meta.wikimedia.org/w/index.php"
-OAUTH_CONSUMER_KEY = os.environ.get("OAUTH_CONSUMER_KEY")
-OAUTH_CONSUMER_SECRET = os.environ.get("OAUTH_CONSUMER_SECRET")
-OAUTH_ENABLED = bool(mwoauth and OAUTH_CONSUMER_KEY and OAUTH_CONSUMER_SECRET)
-DB_PATH = os.environ.get("WIKIRANK_DB",
-                         os.path.join(os.path.expanduser("~"), "wikirank.db"))
-
-# ── База даних ───────────────────────────────────────────────
-def db():
-    if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA journal_mode=WAL")
-    return g.db
-
-@app.teardown_appcontext
-def close_db(_):
-    d = g.pop("db", None)
-    if d:
-        d.close()
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users(
-  login TEXT PRIMARY KEY, name TEXT, pass TEXT, role TEXT);
-CREATE TABLE IF NOT EXISTS contests(
-  id TEXT PRIMARY KEY, name TEXT, template TEXT, projects TEXT,
-  participants TEXT, formula TEXT, start TEXT, end TEXT);
-CREATE TABLE IF NOT EXISTS results(
-  contest_id TEXT PRIMARY KEY, data TEXT, updated INTEGER);
-CREATE TABLE IF NOT EXISTS scores(
-  contest_id TEXT, participant TEXT, jury TEXT, value REAL,
-  PRIMARY KEY(contest_id, participant, jury));
-CREATE TABLE IF NOT EXISTS comments(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, contest_id TEXT, participant TEXT,
-  jury_name TEXT, text TEXT, date TEXT);
-CREATE TABLE IF NOT EXISTS article_scores(
-  contest_id TEXT, participant TEXT, article TEXT, jury TEXT, value REAL,
-  PRIMARY KEY(contest_id, participant, article, jury));
-CREATE TABLE IF NOT EXISTS article_comments(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, contest_id TEXT, participant TEXT, article TEXT,
-  jury_name TEXT, text TEXT, date TEXT);
-CREATE TABLE IF NOT EXISTS article_reviews(
-  contest_id TEXT, participant TEXT, article TEXT, jury TEXT,
-  PRIMARY KEY(contest_id, participant, article, jury));
-CREATE TABLE IF NOT EXISTS article_assignments(
-  contest_id TEXT, participant TEXT, article TEXT, jury TEXT,
-  PRIMARY KEY(contest_id, participant, article, jury));
-CREATE TABLE IF NOT EXISTS contest_jury(
-  contest_id TEXT, login TEXT, PRIMARY KEY(contest_id, login));
-"""
-
-def init_db():
-    con = sqlite3.connect(DB_PATH)
-    had_reviews = con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='article_reviews'").fetchone()
-    had_cj = con.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='contest_jury'").fetchone()
-    con.executescript(SCHEMA)
-    if not had_reviews:
-        # раніше «перевірено» = є оцінка; переносимо це в явні відмітки
-        con.execute("INSERT OR IGNORE INTO article_reviews "
-                    "SELECT contest_id, participant, article, jury FROM article_scores")
-    cols = [r[1] for r in con.execute("PRAGMA table_info(contests)")]
-    if "tpl_talk_only" not in cols:
-        con.execute("ALTER TABLE contests ADD COLUMN tpl_talk_only INTEGER DEFAULT 0")
-    if "review_scope" not in cols:
-        con.execute("ALTER TABLE contests ADD COLUMN review_scope TEXT DEFAULT 'all'")
-    if not had_cj:
-        # раніше журі було спільним для всіх конкурсів: щоб не порушити перевірки, що вже тривають,
-        # додаємо всіх наявних журі до всіх наявних конкурсів (адмін зможе звузити склад)
-        con.execute("INSERT OR IGNORE INTO contest_jury "
-                    "SELECT c.id, u.login FROM contests c, users u WHERE u.role='jury'")
-    cur = con.execute("SELECT COUNT(*) c FROM users")
-    if cur.fetchone()[0] == 0:
-        con.execute("INSERT INTO users VALUES(?,?,?,?)",
-                    ("admin", "Admin", generate_password_hash("admin"), "admin"))
-    con.commit()
-    con.close()
-
-init_db()
-
-# ── Безпечна формула (AST, без eval) ─────────────────────────
-_OPS = {ast.Add: operator.add, ast.Sub: operator.sub,
-        ast.Mult: operator.mul, ast.Div: operator.truediv,
-        ast.USub: operator.neg, ast.UAdd: operator.pos,
-        ast.Pow: operator.pow}
-FORMULA_VARS = ("bytes", "edits", "articles", "quality", "created", "expanded")
-# мінімальний внесок: учасники з меншою сумою доданих байтів не потрапляють у рейтинг
-MIN_BYTES = 1000
-
-def eval_formula(expr, variables):
-    def _ev(node):
-        if isinstance(node, ast.Expression):
-            return _ev(node.body)
-        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-            return node.value
-        if isinstance(node, ast.Name) and node.id in FORMULA_VARS:
-            return float(variables.get(node.id, 0))
-        if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
-            return _OPS[type(node.op)](_ev(node.left), _ev(node.right))
-        if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
-            return _OPS[type(node.op)](_ev(node.operand))
-        raise ValueError("forbidden node")
-    try:
-        return _ev(ast.parse(expr, mode="eval"))
-    except Exception:
-        return None
-
-def validate_formula(expr):
-    if not expr or not expr.strip():
-        return False
-    v = eval_formula(expr, {k: 1 for k in FORMULA_VARS})
-    return isinstance(v, (int, float))
-
-# ── i18n ─────────────────────────────────────────────────────
-T = {
- "uk": dict(brand="ВікіРанг", tagline="Аналіз внеску учасників вікіпроєктів. Доступ лише для адмінів та журі.",
-   login="Логін", password="Пароль", signin="Увійти", bad="Невірний логін або пароль",
-   or_="або", oauth_btn="Увійти через MediaWiki",
-   oauth_unknown="Ваш вікі-акаунт не зареєстровано в системі як журі чи адмін:",
-   admin="адмін", jury="журі", logout="Вийти", nav_a="Оцінювання", nav_s="Налаштування",
-   tab_c="Конкурси", tab_u="Журі та адміни", tab_p="Мій пароль",
-   new_c="Новий конкурс", edit_c="Редагувати конкурс", c_name="Назва конкурсу",
-   projects="Проєкти — по одному посиланню в рядку",
-   projects_h="Будь-який мовний розділ MediaWiki: uk.wikivoyage.org, en.wikivoyage.org тощо.",
-   d_start="Початок періоду (необов'язково)", d_end="Кінець періоду",
-   tpl="Шаблон конкурсу — ідентифікує статті кампанії",
-   tpl_btn="Витягнути учасників із шаблону", tpl_run="Витягую…",
-   tpl_talk_only="Шаблон розміщено на сторінці обговорення (шукати лише там, а не в статтях)",
-   tpl_h="Знайдуться всі статті з шаблоном; автори редагувань у межах дат додадуться до списку (боти відсіюються).",
-   parts="Учасники — по одному імені в рядку", formula="Формула ранжування для журі",
-   formula_h="Змінні: bytes (байти), edits (редагування), articles (сторінки), quality (сер. оцінка журі)",
-   save="Зберегти", create="Створити", cancel="Скасувати", edit="Редагувати", delete="Видалити",
-   no_c="Ще немає жодного конкурсу.", parts_n="учасників",
-   add_u="Додати обліковий запис", role="Роль", u_name="Ім'я (видиме в коментарях)",
-   accounts="Облікові записи", its_you="це ви",
-   ch_pass="Зміна пароля", new_pass="Новий пароль", again="Ще раз",
-   mode="Режим аналізу", quant="Кількісний", qual="Якісний",
-   qual_h="Якісний аналіз автоматично показує й кількісний внесок.",
-   modes_h="Режими можна вмикати окремо або разом.",
-   check="Перевірити внесок", checking="Перевіряю…", export="Експорт CSV ↓",
-   th_u="Учасник", th_b="Додано байтів", th_e="Ред. / стор.", th_my="Моя оцінка",
-   th_avg="Сер. якість", th_score="Бал за формулою", scores_n="оцін.",
-   comments="Коментарі", no_comments="Коментарів ще немає.",
-   comment_ph="Ваш коментар до внеску учасника…", err="помилка",
-   no_parts="Учасників ще немає — адмін може додати їх у налаштуваннях.",
-   f_of="Формула конкурсу:", saved="Збережено ✓",
-   articles_btn="Статті", no_articles="У межах конкурсу немає редагувань статей.",
-   created="створено", expanded="доповнено",
-   filter_all="Усі", filter_created="Лише нові", filter_expanded="Лише доповнені",
-   jury_no_check="Запуск перевірки доступний адміну. Результати вже завантажені.",
-   view="Переглянути", open_article="Відкрити статтю", loading="Завантаження…",
-   my_pass_title="Мій пароль",
-   footer="Кількісний внесок = сума доданих байтів через API MediaWiki."),
- "en": dict(brand="WikiRank", tagline="Contribution analysis for wiki contests. Admins and jury only.",
-   login="Login", password="Password", signin="Sign in", bad="Wrong login or password",
-   or_="or", oauth_btn="Log in with MediaWiki",
-   oauth_unknown="Your wiki account is not registered in the system as jury or admin:",
-   admin="admin", jury="jury", logout="Log out", nav_a="Assessment", nav_s="Settings",
-   tab_c="Contests", tab_u="Jury & admins", tab_p="My password",
-   new_c="New contest", edit_c="Edit contest", c_name="Contest name",
-   projects="Projects — one link per line",
-   projects_h="Any MediaWiki language edition: uk.wikivoyage.org, en.wikivoyage.org, etc.",
-   d_start="Period start (optional)", d_end="Period end",
-   tpl="Contest template — identifies campaign articles",
-   tpl_btn="Extract participants from template", tpl_run="Extracting…",
-   tpl_talk_only="Template is placed on talk pages (search only there, not in articles)",
-   tpl_h="Finds every article transcluding the template; revision authors within the dates are merged into the list (bots filtered out).",
-   parts="Participants — one username per line", formula="Ranking formula for the jury",
-   formula_h="Variables: bytes, edits, articles, quality (avg jury score)",
-   save="Save", create="Create", cancel="Cancel", edit="Edit", delete="Delete",
-   no_c="No contests yet.", parts_n="participants",
-   add_u="Add account", role="Role", u_name="Name (visible in comments)",
-   accounts="Accounts", its_you="that's you",
-   ch_pass="Change password", new_pass="New password", again="Repeat",
-   mode="Analysis mode", quant="Quantitative", qual="Qualitative",
-   qual_h="Qualitative analysis automatically shows quantitative contribution too.",
-   modes_h="Modes can be enabled separately or together.",
-   check="Check contributions", checking="Checking…", export="Export CSV ↓",
-   th_u="Participant", th_b="Bytes added", th_e="Edits / pages", th_my="My score",
-   th_avg="Avg quality", th_score="Formula score", scores_n="score(s)",
-   comments="Comments", no_comments="No comments yet.",
-   comment_ph="Your comment on this participant's contribution…", err="error",
-   no_parts="No participants yet — an admin can add them in settings.",
-   f_of="Contest formula:", saved="Saved ✓",
-   articles_btn="Articles", no_articles="No article edits within the contest scope.",
-   created="created", expanded="expanded",
-   filter_all="All", filter_created="New only", filter_expanded="Expanded only",
-   jury_no_check="Running the check is admin-only. Results are already loaded.",
-   view="View", open_article="Open article", loading="Loading…",
-   my_pass_title="My password",
-   footer="Quantitative contribution = sum of added bytes via the MediaWiki API."),
- "pl": dict(brand="WikiRank", tagline="Analiza wkładu uczestników konkursów wiki. Dostęp tylko dla adminów i jury.",
-   login="Login", password="Hasło", signin="Zaloguj się", bad="Nieprawidłowy login lub hasło",
-   or_="lub", oauth_btn="Zaloguj się przez MediaWiki",
-   oauth_unknown="Twoje konto wiki nie jest zarejestrowane w systemie jako jury lub admin:",
-   admin="admin", jury="jury", logout="Wyloguj się", nav_a="Ocenianie", nav_s="Ustawienia",
-   tab_c="Konkursy", tab_u="Jury i admini", tab_p="Moje hasło",
-   new_c="Nowy konkurs", edit_c="Edytuj konkurs", c_name="Nazwa konkursu",
-   projects="Projekty — jeden link w wierszu",
-   projects_h="Dowolna wersja językowa MediaWiki: uk.wikivoyage.org, en.wikivoyage.org itd.",
-   d_start="Początek okresu (opcjonalnie)", d_end="Koniec okresu",
-   tpl="Szablon konkursu — identyfikuje artykuły kampanii",
-   tpl_btn="Wyodrębnij uczestników z szablonu", tpl_run="Wyodrębnianie…",
-   tpl_talk_only="Szablon umieszczony na stronie dyskusji (szukaj tylko tam, nie w artykułach)",
-   tpl_h="Znajdzie wszystkie artykuły z szablonem; autorzy edycji w podanym okresie zostaną dodani do listy (boty są pomijane).",
-   parts="Uczestnicy — jedna nazwa użytkownika w wierszu", formula="Formuła rankingowa dla jury",
-   formula_h="Zmienne: bytes (bajty), edits (edycje), articles (strony), quality (śr. ocena jury)",
-   save="Zapisz", create="Utwórz", cancel="Anuluj", edit="Edytuj", delete="Usuń",
-   no_c="Nie ma jeszcze żadnego konkursu.", parts_n="uczestników",
-   add_u="Dodaj konto", role="Rola", u_name="Imię (widoczne w komentarzach)",
-   accounts="Konta", its_you="to ty",
-   ch_pass="Zmiana hasła", new_pass="Nowe hasło", again="Powtórz",
-   mode="Tryb analizy", quant="Ilościowy", qual="Jakościowy",
-   qual_h="Analiza jakościowa automatycznie pokazuje też wkład ilościowy.",
-   modes_h="Tryby można włączać osobno lub razem.",
-   check="Sprawdź wkład", checking="Sprawdzanie…", export="Eksport CSV ↓",
-   th_u="Uczestnik", th_b="Dodane bajty", th_e="Edycje / strony", th_my="Moja ocena",
-   th_avg="Śr. jakość", th_score="Wynik wg formuły", scores_n="ocen",
-   comments="Komentarze", no_comments="Jeszcze brak komentarzy.",
-   comment_ph="Twój komentarz do wkładu uczestnika…", err="błąd",
-   no_parts="Jeszcze brak uczestników — admin może ich dodać w ustawieniach.",
-   f_of="Formuła konkursu:", saved="Zapisano ✓",
-   articles_btn="Artykuły", no_articles="Brak edycji artykułów w ramach konkursu.",
-   created="utworzono", expanded="rozbudowano",
-   filter_all="Wszystkie", filter_created="Tylko nowe", filter_expanded="Tylko rozbudowane",
-   jury_no_check="Uruchomienie sprawdzenia dostępne tylko dla admina. Wyniki są już załadowane.",
-   view="Zobacz", open_article="Otwórz artykuł", loading="Ładowanie…",
-   my_pass_title="Moje hasło",
-   footer="Wkład ilościowy = suma dodanych bajtów przez API MediaWiki."),
-}
-
-# ── Додаткові рядки інтерфейсу (статуси перевірки, розподіл, нові/доповнені) ──
-_EXTRA = {
- "uk": dict(
-   th_split="Нові / доповн.", th_split_b="Байти: нові / доповнені",
-   reviewed="Перевірено", unreviewed="Не перевірено",
-   mark_rev="Позначити перевіреною", unmark_rev="Зняти позначку", rev_next="Перевірено → далі",
-   prev="Назад", next="Далі",
-   tab_preview="Превʼю", tab_article="Стаття", tab_history="Історія",
-   open_new="Відкрити в новій вкладці ↗",
-   iframe_hint="Якщо вікі не показується у вікні — відкрийте статтю в новій вкладці.",
-   filter_todo="Не перевірені", filter_done="Перевірені", filter_mine="Призначені мені",
-   mine="мої", assigned_to="Призначено",
-   distribute="Розподілити між журі",
-   distribute_h="Рівномірно розподіляє статті між членами журі; уже призначені статті зберігаються.",
-   per_article="Журі на статтю", reset_dist="Перерозподілити з нуля",
-   dist_done="Розподілено статей", load_title="Розподіл і прогрес журі",
-   th_jury="Журі", th_assigned="Призначено", th_reviewed="Перевірено",
-   th_progress="Перевірено мною", my_assigned="мої призначені",
-   no_jury="Немає облікових записів журі.", no_results="Спершу запустіть «Перевірити внесок».",
-   formula_h="Змінні: bytes (байти), edits (редагування), articles (сторінки), quality (сер. оцінка журі), created (нові статті), expanded (доповнені статті)"),
- "en": dict(
-   th_split="New / expanded", th_split_b="Bytes: new / expanded",
-   reviewed="Reviewed", unreviewed="Not reviewed",
-   mark_rev="Mark as reviewed", unmark_rev="Remove mark", rev_next="Reviewed → next",
-   prev="Back", next="Next",
-   tab_preview="Preview", tab_article="Article", tab_history="History",
-   open_new="Open in a new tab ↗",
-   iframe_hint="If the wiki does not load in the frame, open the article in a new tab.",
-   filter_todo="Not reviewed", filter_done="Reviewed", filter_mine="Assigned to me",
-   mine="mine", assigned_to="Assigned to",
-   distribute="Distribute among jury",
-   distribute_h="Distributes articles evenly among jury members; existing assignments are kept.",
-   per_article="Jurors per article", reset_dist="Redistribute from scratch",
-   dist_done="Articles distributed", load_title="Jury distribution and progress",
-   th_jury="Jury", th_assigned="Assigned", th_reviewed="Reviewed",
-   th_progress="Reviewed by me", my_assigned="my assigned",
-   no_jury="There are no jury accounts.", no_results="Run “Check contributions” first.",
-   formula_h="Variables: bytes, edits, articles, quality (avg jury score), created (new articles), expanded (expanded articles)"),
- "pl": dict(
-   th_split="Nowe / rozbud.", th_split_b="Bajty: nowe / rozbudowane",
-   reviewed="Sprawdzono", unreviewed="Niesprawdzone",
-   mark_rev="Oznacz jako sprawdzone", unmark_rev="Usuń oznaczenie", rev_next="Sprawdzone → dalej",
-   prev="Wstecz", next="Dalej",
-   tab_preview="Podgląd", tab_article="Artykuł", tab_history="Historia",
-   open_new="Otwórz w nowej karcie ↗",
-   iframe_hint="Jeśli wiki nie wczytuje się w oknie, otwórz artykuł w nowej karcie.",
-   filter_todo="Niesprawdzone", filter_done="Sprawdzone", filter_mine="Przydzielone mnie",
-   mine="moje", assigned_to="Przydzielono",
-   distribute="Rozdziel między jury",
-   distribute_h="Równomiernie rozdziela artykuły między członków jury; istniejące przydziały są zachowane.",
-   per_article="Jurorów na artykuł", reset_dist="Rozdziel od nowa",
-   dist_done="Rozdzielono artykułów", load_title="Podział i postęp jury",
-   th_jury="Jury", th_assigned="Przydzielono", th_reviewed="Sprawdzono",
-   th_progress="Sprawdzone przeze mnie", my_assigned="moje przydzielone",
-   no_jury="Brak kont jury.", no_results="Najpierw uruchom „Sprawdź wkład”.",
-   formula_h="Zmienne: bytes (bajty), edits (edycje), articles (strony), quality (śr. ocena jury), created (nowe artykuły), expanded (rozbudowane artykuły)"),
-}
-for _l, _d in _EXTRA.items():
-    T[_l].update(_d)
-T["uk"].update(legacy_title="Перевірено до оновлення",
-               legacy_h="Внесок оцінено в попередній версії: оцінка враховується в якості, статті не розподіляються.")
-T["en"].update(legacy_title="Reviewed before the update",
-               legacy_h="This contribution was assessed in the previous version: its score counts toward quality, and its articles are not distributed.")
-T["uk"].update(my_progress_title="Мій прогрес")
-T["en"].update(my_progress_title="My progress")
-T["pl"].update(my_progress_title="Mój postęp")
-T["uk"].update(review_scope="Що перевіряє журі", scope_all="Усі статті", scope_created="Лише нові статті",
-               scope_expanded="Лише доповнення", scope_label="Перевірка:",
-               scope_h="Обмежує якісну перевірку: розподіл, перелік статей, прогрес і якість враховують лише обрані статті. Кількісний внесок не змінюється.")
-T["en"].update(review_scope="What the jury reviews", scope_all="All articles", scope_created="New articles only",
-               scope_expanded="Expansions only", scope_label="Review:",
-               scope_h="Limits the qualitative review: distribution, article list, progress and quality use only the chosen articles. Quantitative contribution is unchanged.")
-T["pl"].update(review_scope="Co sprawdza jury", scope_all="Wszystkie artykuły", scope_created="Tylko nowe artykuły",
-               scope_expanded="Tylko rozbudowy", scope_label="Sprawdzanie:",
-               scope_h="Ogranicza ocenę jakościową: podział, lista artykułów, postęp i jakość uwzględniają tylko wybrane artykuły. Wkład ilościowy się nie zmienia.")
-T["uk"].update(hidden_min="Приховано учасників із внеском менше мінімального порогу")
-T["en"].update(hidden_min="Participants hidden for contributing less than the minimum")
-T["pl"].update(hidden_min="Ukryci uczestnicy z wkładem poniżej minimalnego progu")
-T["pl"].update(legacy_title="Sprawdzono przed aktualizacją",
-               legacy_h="Ten wkład oceniono w poprzedniej wersji: ocena liczy się do jakości, a artykuły nie są rozdzielane.")
-
-T["uk"].update(hist_date="Дата", hist_user="Користувач", hist_size="Байти", hist_comment="Опис редагування")
-T["en"].update(hist_date="Date", hist_user="User", hist_size="Bytes", hist_comment="Edit summary")
-T["pl"].update(hist_date="Data", hist_user="Użytkownik", hist_size="Bajty", hist_comment="Opis edycji")
-
-_NEW = {
- "uk": dict(
-   th_created_n="Створено", th_expanded_n="Доповнено",
-   formula="Формула ранжування для журі (необов'язково — залиште порожнім, якщо не потрібна)",
-   parts_saved="Список учасників збережено", parts_not_saved="НЕ збережено — натисніть «Зберегти»", parts_save_hint="Щоб список зберігся, натисніть «Створити»",
-   reassign_title="Перепризначити неперевірені статті", reassign_h="Передає лише ті неперевірені статті, що призначені вибраному журі, іншому члену журі. Перевірені статті, оцінки та коментарі лишаються без змін.", reassign_from="Від кого", reassign_to="Кому", reassign_btn="Перепризначити", tip_reassign="Передати неперевірені статті одного журі іншому. Перевірені, оцінки й коментарі не змінюються", reassign_pick="Оберіть обох членів журі", reassign_same="Оберіть різних членів журі", reassign_none="Немає неперевірених статей для передачі", reassign_confirm="Передати неперевірених статей: {n}? Перевірені статті ({k}) залишаться у попереднього журі, оцінки й коментарі не змінюються.", reassign_done="Передано статей",
-   contest_jury="Журі цього конкурсу",
-   contest_jury_h="Лише ці члени журі бачитимуть конкурс і отримуватимуть статті на перевірку. Уже виставлені оцінки та позначки не видаляються.",
-   no_jury_accounts="Спершу створіть облікові записи журі у вкладці «Журі та адміни».",
-   tpl_replace="Замінити поточний список учасників (а не додавати до нього)",
-   save_update="Зберегти й оновити дані",
-   upd_h="Змінили дати, шаблон чи учасників? «Зберегти й оновити дані» збереже зміни в цьому ж конкурсі (оцінки й коментарі лишаються) і одразу перерахує внесок.",
-   tip_th_u="Вікі-акаунт учасника",
-   tip_th_b="Сума доданих байтів за період конкурсу",
-   tip_th_e="Кількість редагувань / кількість унікальних сторінок",
-   tip_th_split="Кількість створених / доповнених статей",
-   tip_th_created_n="Скільки нових статей створив учасник",
-   tip_th_expanded_n="Скільки наявних статей учасник доповнив",
-   tip_th_avg="Середня оцінка журі: спершу по кожній статті, потім по всіх статтях",
-   tip_th_score="Бал за формулою конкурсу",
-   tip_th_progress="Скільки статей перевірено (для журі — з призначених вам)",
-   tip_user_link="Відкрити внесок учасника у вікі",
-   tip_quant="Кількісний внесок: байти, редагування, статті",
-   tip_qual="Якісний аналіз: оцінки журі, прогрес перевірки, список статей",
-   tip_export="Завантажити таблицю у форматі CSV",
-   tip_check="Завантажити з вікі актуальний внесок учасників за період конкурсу",
-   tip_distribute="Розподілити статті між журі цього конкурсу",
-   tip_per_article="Скільком членам журі призначати кожну статтю",
-   tip_reset="Скасувати поточні призначення й розподілити з нуля (оцінки та коментарі не видаляються)",
-   tip_articles_btn="Показати статті учасника",
-   tip_af_all="Усі статті учасника", tip_af_created="Лише створені статті", tip_af_expanded="Лише доповнені статті",
-   tip_rf_all="Без фільтра за статусом перевірки", tip_rf_todo="Статті, яких ви ще не перевірили",
-   tip_rf_done="Статті, які ви вже перевірили", tip_rf_mine="Статті, призначені вам",
-   tip_card="Відкрити статтю для перевірки",
-   tip_prev="Попередня стаття у списку", tip_next="Наступна стаття у списку", tip_close="Закрити (Esc)",
-   tip_status="Ви ще не перевірили цю статтю",
-   tip_unrev="Натисніть, щоб зняти позначку «перевірено»",
-   tip_rev_next="Позначити статтю перевіреною й відкрити наступну",
-   tip_next_btn="Відкрити наступну статтю",
-   tip_my_score="Ваша оцінка статті (число). Виставлена оцінка автоматично позначає статтю перевіреною",
-   tip_comment="Додати коментар до статті",
-   tip_tab_article="Показати статтю у вікні", tip_tab_history="Історія редагувань статті",
-   tip_tab_preview="Короткий опис і зображення зі статті",
-   tip_tab_c="Створення й редагування конкурсів", tip_tab_u="Облікові записи журі та адмінів",
-   tip_tab_p="Зміна вашого пароля",
-   tip_c_name="Назва конкурсу, яку бачать адміни та журі",
-   tip_projects="Вікі-проєкти, у яких рахується внесок, по одному посиланню в рядку",
-   tip_dstart="Редагування раніше цієї дати не враховуються",
-   tip_dend="Редагування пізніше цієї дати не враховуються",
-   tip_tpl="Посилання на шаблон, яким позначено статті конкурсу. Внесок рахується лише в цих статтях",
-   tip_talk="Увімкніть, якщо шаблон стоїть на сторінках обговорення статей",
-   tip_tpl_btn="Знайти статті з шаблоном і зібрати авторів їхніх редагувань за вказаний період",
-   tip_replace="Увімкнено: список учасників буде замінено знайденими. Вимкнено: знайдені додадуться до поточного списку",
-   tip_parts="Імена вікі-акаунтів учасників, по одному в рядку",
-   tip_scope="Які статті перевіряє журі: усі, лише нові чи лише доповнення",
-   tip_formula="Необов'язково. Порожня формула = не використовується. Змінні: bytes, edits, articles, quality, created, expanded",
-   tip_cjury="Хто з журі працює над цим конкурсом",
-   tip_save="Зберегти зміни конкурсу",
-   tip_save_update="Зберегти зміни та одразу заново перерахувати внесок за новими параметрами",
-   tip_edit="Змінити параметри конкурсу без створення нового",
-   tip_delete="Видалити конкурс разом з усіма оцінками й коментарями",
-   tip_role="Адмін налаштовує систему, журі лише оцінює статті",
-   tip_uname="Ім'я, яке буде видно в коментарях",
-   tip_ulogin="Логін для входу; для входу через MediaWiki — ім'я вікі-акаунта",
-   tip_upass="Пароль для входу",
-   tip_create_u="Створити обліковий запис",
-   tip_del_user="Видалити обліковий запис"),
- "en": dict(
-   th_created_n="Created", th_expanded_n="Expanded",
-   formula="Ranking formula for the jury (optional — leave empty if not needed)",
-   parts_saved="Participant list saved", parts_not_saved="NOT saved — click “Save”", parts_save_hint="Click “Create” to keep this list",
-   reassign_title="Reassign unreviewed articles", reassign_h="Moves only the unreviewed articles assigned to the selected juror to another juror. Reviewed articles, scores and comments stay unchanged.", reassign_from="From", reassign_to="To", reassign_btn="Reassign", tip_reassign="Move unreviewed articles from one juror to another. Reviewed articles, scores and comments are not changed", reassign_pick="Choose both jurors", reassign_same="Choose different jurors", reassign_none="No unreviewed articles to move", reassign_confirm="Move {n} unreviewed articles? Reviewed articles ({k}) stay with the previous juror; scores and comments are not changed.", reassign_done="Articles moved",
-   contest_jury="Jury of this contest",
-   contest_jury_h="Only these jury members will see the contest and receive articles to review. Existing scores and marks are not deleted.",
-   no_jury_accounts="First create jury accounts in the “Jury & admins” tab.",
-   tpl_replace="Replace the current participant list (instead of adding to it)",
-   save_update="Save and refresh data",
-   upd_h="Changed dates, template or participants? “Save and refresh data” saves the changes in this same contest (scores and comments are kept) and recalculates contributions right away.",
-   tip_th_u="Participant's wiki account",
-   tip_th_b="Sum of added bytes during the contest period",
-   tip_th_e="Number of edits / number of unique pages",
-   tip_th_split="Number of created / expanded articles",
-   tip_th_created_n="How many new articles the participant created",
-   tip_th_expanded_n="How many existing articles the participant expanded",
-   tip_th_avg="Average jury score: first per article, then across articles",
-   tip_th_score="Score by the contest formula",
-   tip_th_progress="How many articles are reviewed (for jury — of those assigned to you)",
-   tip_user_link="Open the participant's contributions on the wiki",
-   tip_quant="Quantitative contribution: bytes, edits, articles",
-   tip_qual="Qualitative analysis: jury scores, review progress, article list",
-   tip_export="Download the table as CSV",
-   tip_check="Fetch up-to-date contributions of participants from the wiki for the contest period",
-   tip_distribute="Distribute articles among the jury of this contest",
-   tip_per_article="How many jurors each article is assigned to",
-   tip_reset="Drop current assignments and distribute from scratch (scores and comments are not deleted)",
-   tip_articles_btn="Show the participant's articles",
-   tip_af_all="All articles of the participant", tip_af_created="Created articles only", tip_af_expanded="Expanded articles only",
-   tip_rf_all="No filter by review status", tip_rf_todo="Articles you have not reviewed yet",
-   tip_rf_done="Articles you have already reviewed", tip_rf_mine="Articles assigned to you",
-   tip_card="Open the article for review",
-   tip_prev="Previous article in the list", tip_next="Next article in the list", tip_close="Close (Esc)",
-   tip_status="You have not reviewed this article yet",
-   tip_unrev="Click to remove the “reviewed” mark",
-   tip_rev_next="Mark the article as reviewed and open the next one",
-   tip_next_btn="Open the next article",
-   tip_my_score="Your score for the article (number). Giving a score automatically marks the article as reviewed",
-   tip_comment="Add a comment to the article",
-   tip_tab_article="Show the article in the frame", tip_tab_history="Edit history of the article",
-   tip_tab_preview="Short extract and image from the article",
-   tip_tab_c="Create and edit contests", tip_tab_u="Jury and admin accounts",
-   tip_tab_p="Change your password",
-   tip_c_name="Contest name shown to admins and jury",
-   tip_projects="Wiki projects where contributions are counted, one link per line",
-   tip_dstart="Edits before this date are not counted",
-   tip_dend="Edits after this date are not counted",
-   tip_tpl="Link to the template that marks contest articles. Contributions are counted only in these articles",
-   tip_talk="Enable if the template is placed on article talk pages",
-   tip_tpl_btn="Find articles with the template and collect authors of their edits within the given period",
-   tip_replace="On: the participant list is replaced with the found users. Off: found users are added to the current list",
-   tip_parts="Wiki usernames of participants, one per line",
-   tip_scope="Which articles the jury reviews: all, only new or only expansions",
-   tip_formula="Optional. Empty formula = not used. Variables: bytes, edits, articles, quality, created, expanded",
-   tip_cjury="Which jury members work on this contest",
-   tip_save="Save contest changes",
-   tip_save_update="Save changes and immediately recalculate contributions with the new parameters",
-   tip_edit="Change contest parameters without creating a new one",
-   tip_delete="Delete the contest together with all its scores and comments",
-   tip_role="Admins configure the system, jury only assess articles",
-   tip_uname="Name shown in comments",
-   tip_ulogin="Login name; for MediaWiki login — the wiki username",
-   tip_upass="Password for signing in",
-   tip_create_u="Create the account",
-   tip_del_user="Delete the account"),
- "pl": dict(
-   th_created_n="Utworzone", th_expanded_n="Rozbudowane",
-   formula="Formuła rankingowa dla jury (opcjonalnie — zostaw puste, jeśli niepotrzebna)",
-   parts_saved="Lista uczestników zapisana", parts_not_saved="NIE zapisano — kliknij „Zapisz”", parts_save_hint="Kliknij „Utwórz”, aby zachować listę",
-   reassign_title="Przydziel ponownie niesprawdzone artykuły", reassign_h="Przenosi tylko niesprawdzone artykuły wybranego jurora do innego jurora. Sprawdzone artykuły, oceny i komentarze zostają bez zmian.", reassign_from="Od kogo", reassign_to="Komu", reassign_btn="Przydziel ponownie", tip_reassign="Przenieś niesprawdzone artykuły jednego jurora do innego. Sprawdzone, oceny i komentarze nie są zmieniane", reassign_pick="Wybierz obu jurorów", reassign_same="Wybierz różnych jurorów", reassign_none="Brak niesprawdzonych artykułów do przeniesienia", reassign_confirm="Przenieść niesprawdzone artykuły: {n}? Sprawdzone artykuły ({k}) zostają u poprzedniego jurora; oceny i komentarze nie są zmieniane.", reassign_done="Przeniesiono artykułów",
-   contest_jury="Jury tego konkursu",
-   contest_jury_h="Tylko ci członkowie jury zobaczą konkurs i dostaną artykuły do sprawdzenia. Wystawione oceny i oznaczenia nie są usuwane.",
-   no_jury_accounts="Najpierw utwórz konta jury w zakładce „Jury i admini”.",
-   tpl_replace="Zastąp bieżącą listę uczestników (zamiast dodawać do niej)",
-   save_update="Zapisz i odśwież dane",
-   upd_h="Zmieniłeś daty, szablon lub uczestników? „Zapisz i odśwież dane” zapisze zmiany w tym samym konkursie (oceny i komentarze zostają) i od razu przeliczy wkład.",
-   tip_th_u="Konto wiki uczestnika",
-   tip_th_b="Suma dodanych bajtów w okresie konkursu",
-   tip_th_e="Liczba edycji / liczba unikalnych stron",
-   tip_th_split="Liczba utworzonych / rozbudowanych artykułów",
-   tip_th_created_n="Ile nowych artykułów utworzył uczestnik",
-   tip_th_expanded_n="Ile istniejących artykułów rozbudował uczestnik",
-   tip_th_avg="Średnia ocena jury: najpierw dla każdego artykułu, potem ze wszystkich artykułów",
-   tip_th_score="Wynik wg formuły konkursu",
-   tip_th_progress="Ile artykułów sprawdzono (dla jury — z przydzielonych tobie)",
-   tip_user_link="Otwórz wkład uczestnika w wiki",
-   tip_quant="Wkład ilościowy: bajty, edycje, artykuły",
-   tip_qual="Analiza jakościowa: oceny jury, postęp sprawdzania, lista artykułów",
-   tip_export="Pobierz tabelę jako CSV",
-   tip_check="Pobierz z wiki aktualny wkład uczestników z okresu konkursu",
-   tip_distribute="Rozdziel artykuły między jury tego konkursu",
-   tip_per_article="Ilu jurorom przydzielić każdy artykuł",
-   tip_reset="Usuń bieżące przydziały i rozdziel od nowa (oceny i komentarze nie są usuwane)",
-   tip_articles_btn="Pokaż artykuły uczestnika",
-   tip_af_all="Wszystkie artykuły uczestnika", tip_af_created="Tylko utworzone artykuły", tip_af_expanded="Tylko rozbudowane artykuły",
-   tip_rf_all="Bez filtra statusu sprawdzenia", tip_rf_todo="Artykuły, których jeszcze nie sprawdziłeś",
-   tip_rf_done="Artykuły, które już sprawdziłeś", tip_rf_mine="Artykuły przydzielone tobie",
-   tip_card="Otwórz artykuł do sprawdzenia",
-   tip_prev="Poprzedni artykuł na liście", tip_next="Następny artykuł na liście", tip_close="Zamknij (Esc)",
-   tip_status="Nie sprawdziłeś jeszcze tego artykułu",
-   tip_unrev="Kliknij, aby usunąć oznaczenie „sprawdzono”",
-   tip_rev_next="Oznacz artykuł jako sprawdzony i otwórz następny",
-   tip_next_btn="Otwórz następny artykuł",
-   tip_my_score="Twoja ocena artykułu (liczba). Wystawienie oceny automatycznie oznacza artykuł jako sprawdzony",
-   tip_comment="Dodaj komentarz do artykułu",
-   tip_tab_article="Pokaż artykuł w oknie", tip_tab_history="Historia edycji artykułu",
-   tip_tab_preview="Krótki opis i obraz z artykułu",
-   tip_tab_c="Tworzenie i edycja konkursów", tip_tab_u="Konta jury i adminów",
-   tip_tab_p="Zmiana twojego hasła",
-   tip_c_name="Nazwa konkursu widoczna dla adminów i jury",
-   tip_projects="Projekty wiki, w których liczy się wkład, jeden link w wierszu",
-   tip_dstart="Edycje sprzed tej daty nie są liczone",
-   tip_dend="Edycje po tej dacie nie są liczone",
-   tip_tpl="Link do szablonu oznaczającego artykuły konkursu. Wkład liczy się tylko w tych artykułach",
-   tip_talk="Włącz, jeśli szablon jest na stronach dyskusji artykułów",
-   tip_tpl_btn="Znajdź artykuły z szablonem i zbierz autorów ich edycji z podanego okresu",
-   tip_replace="Włączone: lista uczestników zostanie zastąpiona znalezionymi. Wyłączone: znalezieni zostaną dodani do bieżącej listy",
-   tip_parts="Nazwy kont wiki uczestników, jedna w wierszu",
-   tip_scope="Które artykuły sprawdza jury: wszystkie, tylko nowe lub tylko rozbudowy",
-   tip_formula="Opcjonalnie. Pusta formuła = nieużywana. Zmienne: bytes, edits, articles, quality, created, expanded",
-   tip_cjury="Którzy członkowie jury pracują przy tym konkursie",
-   tip_save="Zapisz zmiany konkursu",
-   tip_save_update="Zapisz zmiany i od razu przelicz wkład według nowych parametrów",
-   tip_edit="Zmień parametry konkursu bez tworzenia nowego",
-   tip_delete="Usuń konkurs razem ze wszystkimi ocenami i komentarzami",
-   tip_role="Admin konfiguruje system, jury tylko ocenia artykuły",
-   tip_uname="Imię widoczne w komentarzach",
-   tip_ulogin="Login do logowania; dla logowania przez MediaWiki — nazwa konta wiki",
-   tip_upass="Hasło do logowania",
-   tip_create_u="Utwórz konto",
-   tip_del_user="Usuń konto"),
-}
-for _l, _d in _NEW.items():
-    T[_l].update(_d)
-
-def lang():
-    l = request.args.get("lang") or session.get("lang") or "uk"
-    if l not in T:
-        l = "uk"
-    session["lang"] = l
-    return l
-
-# ── Авторизація ──────────────────────────────────────────────
-def login_required(f):
-    @wraps(f)
-    def w(*a, **k):
-        if "user" not in session:
-            return redirect(url_for("login_view"))
-        return f(*a, **k)
-    return w
-
-def admin_required(f):
-    @wraps(f)
-    def w(*a, **k):
-        if "user" not in session:
-            return redirect(url_for("login_view"))
-        if session["user"]["role"] != "admin":
-            return "Forbidden", 403
-        return f(*a, **k)
-    return w
-
-# ── Шаблони ──────────────────────────────────────────────────
-BASE_CSS = """
-:root{--ink:#101820;--ink2:#3d4852;--mut:#3d4c5c;--paper:#f2f4f6;--card:#fff;
---line:#c3cfe0;--acc:#152331;--acc-soft:#e3ecec;--gold:#b07a1e;--ok:#1d7a4f;--err:#b3261e;
---grad-light:linear-gradient(135deg,#acb6e5,#86fde8);--grad-dark:linear-gradient(135deg,#152331,#000);
---mono:ui-monospace,Menlo,monospace}
-*{box-sizing:border-box}body{margin:0;background:var(--grad-light);background-attachment:fixed;color:var(--ink);
-font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-input,select,textarea{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px 10px;width:100%}
-input:focus,select:focus,textarea:focus{outline:2px solid var(--acc)}
-button{font:inherit;cursor:pointer;border:none;border-radius:8px;padding:8px 14px}
-.btn-p{background:var(--grad-dark);color:#fff;font-weight:600}.btn-p:disabled{background:#9daed9}
-.btn-s{background:#fff;border:1px solid var(--line);color:var(--ink2)}
-.btn-d{background:#fff;border:1px solid #eacdcb;color:var(--err)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:14px}
-.lbl{display:block;font-size:12px;font-weight:600;color:var(--ink2);margin:10px 0 4px}
-.hint{font-size:12px;color:var(--mut)}.mono{font-family:var(--mono)}
-.chip{font-family:var(--mono);font-size:12px;background:var(--acc-soft);color:#1c5250;border-radius:6px;padding:2px 8px}
-.tag-a{background:var(--grad-dark);color:#86fde8}.tag-j{background:var(--acc-soft);color:#1c5250}
-table{width:100%;border-collapse:collapse}
-th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);text-align:left;
-padding:8px 10px;border-bottom:2px solid var(--line);white-space:nowrap}
-td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
-.bar{height:5px;background:var(--acc-soft);border-radius:3px;min-width:70px;overflow:hidden}
-.bar i{display:block;height:100%;background:var(--grad-dark)}
-.pbar{height:8px;background:var(--acc-soft);border-radius:4px;overflow:hidden;width:100%}
-.pbar i{display:block;height:100%;background:var(--grad-dark);transition:width .3s}
-a.wl{color:#1c5250;text-decoration:none;font-weight:600}
-header{background:var(--grad-dark);color:#fff;padding:12px 20px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-header a{color:#cfd8e0;text-decoration:none}header a.on,header a:hover{color:#fff}
-.mode{display:inline-flex;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
-.mode button{border-radius:0;background:#fff;color:var(--ink2);border-right:1px solid var(--line)}
-.mode button:last-child{border-right:none}.mode button.on{background:var(--grad-dark);color:#fff;font-weight:600}
-main{max-width:1200px;margin:0 auto;padding:20px}
-.langsw a{font-size:12px;font-weight:700;padding:4px 8px;border:1px solid #33424f;border-radius:6px;margin-left:4px}
-.langsw a.on{background:#86fde8;color:#101820}
-.carousel-wrap{position:relative;margin:4px 0}
-.carousel{display:flex;gap:12px;overflow-x:auto;padding:4px 2px 12px;scroll-snap-type:x proximity;scrollbar-width:thin}
-.carousel::-webkit-scrollbar{height:6px}
-.carousel::-webkit-scrollbar-thumb{background:var(--line);border-radius:3px}
-.art-card{flex:0 0 150px;scroll-snap-align:start;cursor:pointer;border-radius:12px;overflow:hidden;
-background:#fff;border:1px solid var(--line);transition:transform .15s,box-shadow .15s}
-.art-card:hover{transform:translateY(-3px);box-shadow:0 6px 14px rgba(21,35,49,.18)}
-.art-card .thumb{width:100%;height:96px;object-fit:cover;display:block;background:var(--acc-soft)}
-.art-card .thumb-ph{width:100%;height:96px;background:var(--acc-soft);display:flex;align-items:center;
-justify-content:center;color:var(--mut);font-size:11px}
-.art-card .body{padding:8px}
-.art-title{font-size:12px;font-weight:600;line-height:1.3;max-height:2.6em;overflow:hidden;color:var(--ink)}
-.car-nav{position:absolute;top:34px;width:30px;height:30px;border-radius:50%;background:var(--grad-dark);
-color:#fff;display:flex;align-items:center;justify-content:center;z-index:5;
-box-shadow:0 2px 6px rgba(0,0,0,.35);font-size:16px;line-height:1}
-.car-nav.prev{left:-8px}.car-nav.next{right:-8px}
-.st-ok{background:#e6f4ea;color:#1d7a4f}.st-todo{background:#fdf0dc;color:#9a5b00}
-.md-back{position:fixed;inset:0;background:rgba(16,24,32,.6);z-index:1000;display:flex;align-items:center;justify-content:center;padding:12px}
-.md-box{background:#fff;border-radius:14px;width:100%;max-width:1360px;height:94vh;display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,1fr);overflow:hidden}
-.md-left{display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--line)}
-.md-right{padding:16px 18px;overflow:auto}
-.md-tabs{display:flex;gap:6px;padding:10px 12px;border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap}
-.md-tabs button{background:#fff;border:1px solid var(--line);color:var(--ink2);padding:5px 12px}
-.md-tabs button.on{background:var(--grad-dark);color:#fff;font-weight:600}
-.md-pane{flex:1;overflow:auto;padding:16px 18px}
-.md-frame{flex:1;width:100%;border:0;min-height:0}
-.md-top{display:flex;gap:8px;align-items:center;margin-bottom:10px}
-@media(max-width:820px){.md-box{grid-template-columns:1fr;overflow:auto;height:96vh}.md-left{height:62vh}}
-"""
-
-LOGIN_HTML = """<!doctype html><html lang="{{l}}"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{t.brand}}</title><style>""" + BASE_CSS + """</style>
-<body style="display:grid;place-items:center;min-height:100vh">
-<div class="card" style="width:380px;max-width:95vw">
- <div style="display:flex;justify-content:space-between">
-  <div><div class="mono" style="font-size:12px;color:var(--gold);letter-spacing:.12em">WIKI·CONTEST</div>
-  <h1 style="margin:4px 0">{{t.brand}}</h1></div>
-  <div class="langsw"><a href="?lang=uk" class="{{'on' if l=='uk' else ''}}" style="color:var(--ink2)">УКР</a><a
-   href="?lang=en" class="{{'on' if l=='en' else ''}}" style="color:var(--ink2)">ENG</a><a
-   href="?lang=pl" class="{{'on' if l=='pl' else ''}}" style="color:var(--ink2)">PL</a></div>
- </div>
- <div class="hint" style="margin-bottom:12px">{{t.tagline}}</div>
- <form method="post">
-  <label class="lbl">{{t.login}}</label><input name="login" autofocus>
-  <label class="lbl">{{t.password}}</label><input name="password" type="password">
-  {% if err %}<div style="color:var(--err);margin-top:8px">{{t.bad}}</div>{% endif %}
-  <button class="btn-p" style="width:100%;margin-top:14px">{{t.signin}}</button>
- </form>
- {% if oauth_unknown %}
- <div style="color:var(--err);margin-top:12px;font-size:13px">{{t.oauth_unknown}} «{{oauth_unknown}}»</div>
- {% endif %}
- {% if oauth_enabled %}
- <div style="display:flex;align-items:center;gap:10px;margin:16px 0">
-  <div style="flex:1;height:1px;background:var(--line)"></div><span class="hint" style="font-size:11px">{{t.or_}}</span><div style="flex:1;height:1px;background:var(--line)"></div>
- </div>
- <a href="{{ url_for('login_oauth') }}" class="btn-s" style="display:block;text-align:center;text-decoration:none;box-sizing:border-box">{{t.oauth_btn}}</a>
- {% endif %}
-</div></body></html>"""
-
-MAIN_HTML = """<!doctype html><html lang="{{l}}"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{t.brand}}</title><style>""" + BASE_CSS + """</style>
-<body>
-<header>
- <div><span class="mono" style="font-size:11px;color:#f5d789;letter-spacing:.12em">WIKI·CONTEST</span>
- <div style="font-weight:800;font-size:18px">{{t.brand}}</div></div>
- {% if contests %}
- <form method="get" style="margin:0"><input type="hidden" name="view" value="{{view}}">
-  <select name="contest" onchange="this.form.submit()" style="width:auto;background:#1d2a36;color:#fff;border-color:#33424f">
-  {% for c in contests %}<option value="{{c.id}}" {{'selected' if c.id==cid else ''}}>{{c.name}}</option>{% endfor %}
-  </select></form>
- {% endif %}
- <nav>
-  <a href="?view=analysis&contest={{cid or ''}}" class="{{'on' if view=='analysis' else ''}}">{{t.nav_a}}</a>
-  {% if me.role=='admin' %} · <a href="?view=admin&contest={{cid or ''}}" class="{{'on' if view=='admin' else ''}}">{{t.nav_s}}</a>{% endif %}
- </nav>
- <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
-  <span class="langsw"><a href="?lang=uk&view={{view}}&contest={{cid or ''}}" class="{{'on' if l=='uk' else ''}}">УКР</a><a
-    href="?lang=en&view={{view}}&contest={{cid or ''}}" class="{{'on' if l=='en' else ''}}">ENG</a><a
-    href="?lang=pl&view={{view}}&contest={{cid or ''}}" class="{{'on' if l=='pl' else ''}}">PL</a></span>
-  <span class="chip {{'tag-a' if me.role=='admin' else 'tag-j'}}">{{t[me.role]}}</span>
-  <b>{{me.name}}</b> <a href="{{url_for('logout')}}">{{t.logout}}</a>
- </div>
-</header>
-<main>
-{% if view=='admin' and me.role=='admin' %}{% include 'ADMIN' %}{% else %}{% include 'ANALYSIS' %}{% endif %}
-<div class="hint" style="margin-top:14px">{{t.footer}}</div>
-</main>
-<script>
-const T={{tjson|safe}}, CID={{cid|tojson}}, LANG={{l|tojson}};
-function pbar(el,done,total,label){
- const pct=total?Math.round(done/total*100):0;
- el.innerHTML=`<div class="pbar"><i style="width:${pct}%"></i></div>
- <div class="hint mono" style="font-size:11px">${done} / ${total} · ${pct}% ${label?'· '+esc(label):''}</div>`;
-}
-function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-// анонімний редактор: IPv4, IPv6 або замаскований тимчасовий обліковий запис (~2024-1…)
-function isAnon(u){
- if(/^~/.test(u))return true;
- if(/^\\d{1,3}(\\.\\d{1,3}){3}$/.test(u))return true;
- if(/^[0-9a-f]{1,4}(::?[0-9a-f]{0,4}){2,7}$/i.test(u))return true;
- return false;
-}
-function sleep(ms){return new Promise(res=>setTimeout(res,ms))}
-async function mw(api,params,tries){
- tries=tries||0;
- const p=new URLSearchParams({format:'json',origin:'*',...params});
- const r=await fetch(api+'?'+p);
- if(r.status===429||r.status===503){
-  if(tries>=6)throw new Error('HTTP '+r.status+' (ліміт запитів вікі, спроби вичерпано)');
-  const ra=parseFloat(r.headers.get('Retry-After'))||0;
-  await sleep(Math.max(ra*1000,800*Math.pow(2,tries)));
-  return mw(api,params,tries+1);
- }
- if(!r.ok)throw new Error('HTTP '+r.status);
- const d=await r.json();if(d.error)throw new Error(d.error.info||'API error');return d;
-}
-async function fetchContribs(api,user,startISO,endISO){
- let cont=null,all=[],g=0;
- do{const params={action:'query',list:'usercontribs',ucuser:user,uclimit:'500',ucprop:'title|timestamp|sizediff|flags'};
-  if(startISO)params.ucend=startISO;if(endISO)params.ucstart=endISO;
-  if(cont)params.uccontinue=cont;
-  const d=await mw(api,params);
-  all.push(...(d.query?.usercontribs||[]));cont=d.continue?.uccontinue||null;g++;
- }while(cont&&g<10);return all;
-}
-// парсить посилання на шаблон конкурсу -> {api, title, host}
-function templateInfo(url){
- try{
-  const u=new URL(url.trim());
-  const m=u.pathname.match(/\\/wiki\\/(.+)$/);if(!m)return null;
-  return{api:u.origin+'/w/api.php',title:decodeURIComponent(m[1]).replace(/_/g,' '),host:u.hostname};
- }catch(e){return null}
-}
-// офіційні конкурсні статті за шаблоном (з урахуванням "лише обговорення")
-async function templatePages(tp,talkOnly){
- let cont=null,raw=[],g=0;
- do{const params={action:'query',list:'embeddedin',eititle:tp.title,eilimit:'500',einamespace:talkOnly?'1':'0|1'};
-  if(cont)params.eicontinue=cont;const d=await mw(tp.api,params);
-  raw.push(...(d.query?.embeddedin||[]));cont=d.continue?.eicontinue||null;g++;
- }while(cont&&g<10);
- const nsd=await mw(tp.api,{action:'query',meta:'siteinfo',siprop:'namespaces'});
- const talkPfx=(nsd.query?.namespaces?.['1']?.['*']||'Talk')+':';
- const pageSet=new Set();
- raw.forEach(x=>pageSet.add(x.ns===1?x.title.slice(talkPfx.length):x.title));
- return[...pageSet];
-}
-// повна історія редагувань статті з обчисленим приростом байтів на редагування
-async function pageRevisionsWithDiff(api,title){
- let cont=null,all=[],g=0;
- do{
-  const params={action:'query',prop:'revisions',titles:title,
-   rvprop:'user|timestamp|size|flags|ids',rvlimit:'500',rvdir:'older'};
-  if(cont)params.rvcontinue=cont;
-  const d=await mw(api,params);
-  const page=Object.values(d.query?.pages||{})[0];
-  all.push(...(page?.revisions||[]));
-  cont=d.continue?.rvcontinue||null;g++;
- }while(cont&&g<10);
- for(let i=0;i<all.length;i++){
-  const older=all[i+1];
-  all[i].diff=older?(all[i].size-older.size):all[i].size;
- }
- return all;
-}
-</script>
-{% if view=='admin' and me.role=='admin' %}
-<script>
-async function extractParticipants(){
- const url=document.getElementById('tpl').value.trim();
- const msg=document.getElementById('extmsg'),bar=document.getElementById('extbar');
- const tp=templateInfo(url);if(!tp){msg.textContent='✗ URL';return}
- const s=document.getElementById('start').value,e=document.getElementById('end').value;
- const sISO=s?new Date(s+'T00:00:00Z').toISOString():null,eISO=e?new Date(e+'T23:59:59Z').toISOString():null;
- const btn=document.getElementById('extbtn');btn.disabled=true;msg.textContent=T.tpl_run;
- const talkOnly=document.getElementById('tplTalkOnly').checked;
- try{
-  const pages=await templatePages(tp,talkOnly);
-  const users=new Set();
-  let failed=0;
-  for(let i=0;i<pages.length;i++){
-   pbar(bar,i,pages.length,pages[i]);
-   try{
-    const params={action:'query',prop:'revisions',titles:pages[i],rvprop:'user|timestamp',rvlimit:'500'};
-    if(sISO)params.rvend=sISO;if(eISO)params.rvstart=eISO;
-    const d=await mw(tp.api,params);
-    const page=Object.values(d.query?.pages||{})[0];
-    (page?.revisions||[]).forEach(r=>{if(r.user&&!/bot$|бот$/i.test(r.user.trim())&&!isAnon(r.user.trim()))users.add(r.user)});
-   }catch(e){failed++}
-   if(i%5===4)await sleep(150);
-  }
-  pbar(bar,pages.length,pages.length,'');
-  const ta=document.getElementById('parts');
-  const existing=document.getElementById('tplReplace').checked?[]:ta.value.split('\\n').map(s=>s.trim()).filter(Boolean);
-  ta.value=[...new Set([...existing,...users])].sort((a,b)=>a.localeCompare(b)).join('\\n');
-  msg.textContent='✓ '+pages.length+' / '+users.size+(failed?' ('+failed+' сторінок пропущено через помилку)':'');
-  const cidEl=document.querySelector('form input[name=id]'),cidV=cidEl?cidEl.value:'';
-  if(cidV){
-   try{
-    const list=ta.value.split('\\n').map(x=>x.trim()).filter(Boolean);
-    const rs=await fetch('/api/contest/'+encodeURIComponent(cidV)+'/participants',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({participants:list})});
-    if(!rs.ok)throw new Error(rs.status);
-    msg.textContent+=' · '+T.parts_saved+' ('+list.length+')';
-   }catch(e2){msg.textContent+=' · ⚠ '+T.parts_not_saved}
-  }else msg.textContent+=' · '+T.parts_save_hint;
- }catch(err){msg.textContent='✗ '+err.message}
- btn.disabled=false;
-}
-</script>
-{% else %}
-<script>
-const CONTEST={{cjson|safe}};
-let RESULTS={{rjson|safe}}, ASSESS={{ajson|safe}};
-const JURY_LOGIN={{me.login|tojson}};
-const IS_JURY={{(me.role=='jury')|tojson}};
-const AUTORUN={{(autorun)|tojson}};
-let QUANT=true,QUAL=IS_JURY;
-const projects=(CONTEST?CONTEST.projects:[]).map(p=>{try{const u=new URL(p);
- return{origin:u.origin,api:u.origin+'/w/api.php',label:u.hostname.replace('.org',''),host:u.hostname}}catch(e){return null}}).filter(Boolean);
-
-function setMode(m){if(m==='qual'){QUAL=!QUAL;if(QUAL)QUANT=true}else{if(!QUAL)QUANT=!QUANT}
- document.getElementById('mq').className=QUANT?'on':'';document.getElementById('ml').className=QUAL?'on':'';
- document.getElementById('modehint').textContent=QUAL?T.qual_h:T.modes_h;render()}
-
-async function runCheck(){
- if(!CONTEST)return;
- const btn=document.getElementById('runbtn'),bar=document.getElementById('runbar');
- btn.disabled=true;btn.textContent=T.checking;
- const sISO=CONTEST.start?new Date(CONTEST.start+'T00:00:00Z').toISOString():null;
- const eISO=CONTEST.end?new Date(CONTEST.end+'T23:59:59Z').toISOString():null;
- const out={};
- CONTEST.participants.forEach(u=>out[u]={perProject:{},bytes:0,edits:0,articles:0,_titles:new Set()});
-
- // якщо в конкурсі вказано шаблон — рахуємо внесок ЛИШЕ в межах статей,
- // які дійсно позначені цим шаблоном (а не весь внесок учасника по вікі)
- const tp=CONTEST.template?templateInfo(CONTEST.template):null;
- let tplHost=null,tplPages=[];
- if(tp){
-  try{tplPages=await templatePages(tp,!!CONTEST.tpl_talk_only);tplHost=tp.host}
-  catch(e){tplPages=[];tplHost=null}
- }
-
- const totalSteps=projects.reduce((s,pr)=>s+(pr.host===tplHost?tplPages.length:CONTEST.participants.length),0)||1;
- let done=0;
-
- for(const pr of projects){
-  if(pr.host===tplHost){
-   for(let i=0;i<tplPages.length;i++){
-    pbar(bar,done,totalSteps,tplPages[i]);done++;
-    try{
-     const revs=await pageRevisionsWithDiff(pr.api,tplPages[i]);
-     revs.forEach(r=>{
-      if(!r.timestamp)return;
-      if(sISO&&r.timestamp<sISO)return;
-      if(eISO&&r.timestamp>eISO)return;
-      if(!r.user||!out[r.user])return; // рахуємо тільки офіційних учасників конкурсу
-      const row=out[r.user];
-      if(!row.perProject[pr.host])row.perProject[pr.host]={bytes:0,edits:0,_titles:new Set(),_detail:{}};
-      const pp=row.perProject[pr.host];
-      if(r.diff>0){pp.bytes+=r.diff;row.bytes+=r.diff}
-      pp.edits++;row.edits++;
-      pp._titles.add(tplPages[i]);row._titles.add(pr.host+'::'+tplPages[i]);
-      if(!pp._detail[tplPages[i]])pp._detail[tplPages[i]]={bytes:0,created:false};
-      if(r.diff>0)pp._detail[tplPages[i]].bytes+=r.diff;
-      if('new' in r||r.parentid===0)pp._detail[tplPages[i]].created=true;
-     });
-    }catch(e){/* сторінку могли видалити/перейменувати — пропускаємо */}
-    if(i%5===4)await sleep(150);
-   }
-  }else{
-   for(let i=0;i<CONTEST.participants.length;i++){
-    const user=CONTEST.participants[i];pbar(bar,done,totalSteps,user);done++;
-    const row=out[user];
-    try{const cs=await fetchContribs(pr.api,user,sISO,eISO);let b=0;
-     const detail={};
-     cs.forEach(c=>{
-      if(c.sizediff>0)b+=c.sizediff;
-      row._titles.add(pr.host+'::'+c.title);
-      if(!detail[c.title])detail[c.title]={bytes:0,created:false};
-      if(c.sizediff>0)detail[c.title].bytes+=c.sizediff;
-      if('new' in c)detail[c.title].created=true;
-     });
-     const list=Object.entries(detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
-      .sort((a,b2)=>b2.bytes-a.bytes);
-     row.perProject[pr.host]={bytes:b,edits:cs.length,articles:new Set(cs.map(c=>c.title)).size,list};
-     row.bytes+=b;row.edits+=cs.length;
-    }catch(e){row.perProject[pr.host]={err:String(e.message||e)}}
-    if(i%5===4)await sleep(150);
-   }
-  }
- }
- Object.values(out).forEach(row=>{
-  const pp=row.perProject[tplHost];
-  if(pp&&pp._detail){
-   pp.list=Object.entries(pp._detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created}))
-    .sort((a,b2)=>b2.bytes-a.bytes);
-   pp.articles=pp._titles.size;delete pp._detail;delete pp._titles;
-  }
-  row.articles=row._titles.size;delete row._titles;
- });
- pbar(bar,totalSteps,totalSteps,'');
- RESULTS=out;
- await fetch('/api/results/'+CID,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(out)});
- btn.disabled=false;btn.textContent=T.check;render();
-}
-async function saveScore(user,article,val){
- await fetch('/api/score',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({contest:CID,participant:user,article,value:val===''?null:Number(val)})});
- const r=await fetch('/api/state/'+CID);ASSESS=(await r.json()).assess;render();
-}
-async function saveComment(user,article){
- const inp=document.getElementById('cm_'+idFor(user+'||'+article));
- const text=inp.value.trim();if(!text)return;
- await fetch('/api/comment',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({contest:CID,participant:user,article,text})});
- const r=await fetch('/api/state/'+CID);ASSESS=(await r.json()).assess;render();
-}
-let ARTOPEN=null;
-let ART_FILTER='all'; // 'all' | 'created' | 'expanded'
-let REV_FILTER='all'; // 'all' | 'todo' | 'done' | 'mine'
-let CUR_LIST=[];      // поточний відфільтрований список статей відкритого учасника
-let SCROLL_RESET=false;
-let MTAB='article';   // 'preview' | 'article' | 'history'
-const JURY_LIST={{juryjson|safe}};
-const SCOPE={{((contest.review_scope or 'all') if contest else 'all')|tojson}};
-const MIN_BYTES={{min_bytes}}; // мінімальний внесок для участі в рейтингу
-const LEGACY={{ljson|safe}}; // оцінки/коментарі з попередньої версії (рівень учасника)
-function inScope(it){return SCOPE==='all'||(SCOPE==='created')===!!it.created}
-function legacyDone(user){const l=LEGACY[user];return !!(l&&(Object.keys(l.scores||{}).length||(l.comments||[]).length))}
-function legacyVals(user){const l=LEGACY[user];return l?Object.values(l.scores||{}).filter(v=>v!=null):[]}
-function setArtFilter(f){ART_FILTER=f;SCROLL_RESET=true;render()}
-function setRevFilter(f){REV_FILTER=f;SCROLL_RESET=true;render()}
-function articleLink(origin,title){return origin+'/wiki/'+encodeURIComponent(title.replace(/ /g,'_'))}
-function slot(user,title){const a=ASSESS[user]&&ASSESS[user][title];return a||{scores:{},comments:[],reviewed:[],assigned:[]}}
-function isReviewed(user,title){return legacyDone(user)||(slot(user,title).reviewed||[]).indexOf(JURY_LOGIN)>=0}
-function isMine(user,title){return (slot(user,title).assigned||[]).indexOf(JURY_LOGIN)>=0}
-function juryName(login){const j=JURY_LIST.find(x=>x.login===login);return j?j.name:login}
-async function reloadState(){const r=await fetch('/api/state/'+CID);ASSESS=(await r.json()).assess}
-async function setReviewed(user,title,val){
- await fetch('/api/review',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({contest:CID,participant:user,article:title,reviewed:!!val})});
- await reloadState();render();
-}
-async function runDistribute(){
- const reset=document.getElementById('distReset').checked;
- const per=Number(document.getElementById('distPer').value)||1;
- const msg=document.getElementById('distmsg');
- msg.textContent=T.loading;
- try{
-  const r=await fetch('/api/distribute/'+CID,{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({per_article:per,reset:reset})});
-  const d=await r.json();
-  if(!r.ok||d.error){msg.textContent='✗ '+(T[d.error]||d.error||r.status);return}
-  await reloadState();render();
-  msg.textContent='✓ '+T.dist_done+': '+d.items;
- }catch(e){msg.textContent='✗ '+e.message}
-}
-async function runReassign(){
- const from=document.getElementById('reFrom').value,to=document.getElementById('reTo').value;
- const msg=document.getElementById('distmsg');
- if(!from||!to){msg.textContent='✗ '+T.reassign_pick;return}
- if(from===to){msg.textContent='✗ '+T.reassign_same;return}
- const call=async dry=>{const r=await fetch('/api/reassign/'+CID,{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({from:from,to:to,dry:dry})});const d=await r.json();
-  if(!r.ok||d.error)throw new Error(T[d.error]||d.error||r.status);return d};
- try{
-  msg.textContent=T.loading;
-  const p=await call(true);
-  if(!p.movable){msg.textContent=T.reassign_none+(p.kept?' ('+p.kept+')':'');return}
-  if(!confirm(T.reassign_confirm.replace('{n}',p.movable).replace('{k}',p.kept))){msg.textContent='';return}
-  const d=await call(false);
-  await reloadState();render();
-  msg.textContent='✓ '+T.reassign_done+': '+(d.moved+d.merged)+' — '+juryName(from)+' → '+juryName(to);
- }catch(e){msg.textContent='✗ '+e.message}
-}
-function renderLoad(){
- const box=document.getElementById('loadbox');if(!box)return;
- box.style.display=QUAL?'block':'none';if(!QUAL)return;
- const st={};
- JURY_LIST.forEach(j=>{if(j.role==='jury')st[j.login]={a:0,r:0}});
- Object.values(ASSESS).forEach(pa=>Object.values(pa).forEach(a=>{
-  (a.assigned||[]).forEach(l=>{if(!st[l])st[l]={a:0,r:0};st[l].a++;if((a.reviewed||[]).indexOf(l)>=0)st[l].r++})}));
- const logins=Object.keys(st);
- let h;
- if(!logins.length)h='<div class="hint">'+T.no_jury+'</div>';
- else{
-  h='<table><thead><tr><th>'+T.th_jury+'</th><th>'+T.th_assigned+'</th><th>'+T.th_reviewed+'</th><th style="width:35%"></th></tr></thead><tbody>';
-  logins.forEach(l=>{const s=st[l];const pct=s.a?Math.round(s.r/s.a*100):0;
-   h+='<tr><td><b>'+esc(juryName(l))+'</b></td><td class="mono">'+s.a+'</td><td class="mono">'+s.r+' ('+pct+'%)</td><td><div class="pbar"><i style="width:'+pct+'%"></i></div></td></tr>'});
-  h+='</tbody></table>';
- }
- document.getElementById('loadtbl').innerHTML=h;
-}
-
-// ── Модальне вікно: стаття (iframe) / превʼю / історія зліва, оцінка та коментарі справа ──
-let MODAL=null; // {user,title,origin,host,api,label,bytes,created}
-const EXTRACT_CACHE={};
-const THUMB_PENDING=new Set();
-// пакетне попереднє завантаження мініатюр для карусельних карток
-async function prefetchThumbs(api,host,titles){
- const need=titles.filter(t=>!EXTRACT_CACHE[host+'::'+t]);
- if(!need.length||THUMB_PENDING.has(host))return;
- THUMB_PENDING.add(host);
- for(let i=0;i<need.length;i+=50){
-  const chunk=need.slice(i,i+50);
-  try{
-   const d=await mw(api,{action:'query',prop:'pageimages',piprop:'thumbnail',pithumbsize:'300',titles:chunk.join('|')});
-   Object.values(d.query?.pages||{}).forEach(p=>{
-    EXTRACT_CACHE[host+'::'+p.title]={thumb:p.thumbnail?p.thumbnail.source:null,extract:null};
-   });
-  }catch(e){/* ігноруємо помилки мініатюр — картки покажуться без зображення */}
-  chunk.forEach(t=>{const key=host+'::'+t;if(!EXTRACT_CACHE[key])EXTRACT_CACHE[key]={thumb:null,extract:null}});
-  render();
- }
- THUMB_PENDING.delete(host);
-}
-function openIdx(i){const it=CUR_LIST[i];if(it)openItem(it)}
-function modalIdx(){
- if(!MODAL)return -1;
- return CUR_LIST.findIndex(x=>x.user===MODAL.user&&x.title===MODAL.title&&x.host===MODAL.host);
-}
-function stepModal(d){const i=modalIdx();const n=i>=0?CUR_LIST[i+d]:null;if(n)openItem(n)}
-async function reviewAndNext(){
- if(!MODAL)return;
- const i=modalIdx();const nxt=i>=0?CUR_LIST[i+1]:null;const m=MODAL;
- if(!isReviewed(m.user,m.title))await setReviewed(m.user,m.title,true);
- if(nxt)openItem(nxt);else closeModal();
-}
-function toggleReviewed(){if(MODAL)setReviewed(MODAL.user,MODAL.title,!isReviewed(MODAL.user,MODAL.title))}
-function saveScoreM(v){if(MODAL)saveScore(MODAL.user,MODAL.title,v)}
-async function saveCommentM(){
- const inp=document.querySelector('.md-cm');if(!inp||!MODAL)return;
- const text=inp.value.trim();if(!text)return;
- inp.value='';
- await fetch('/api/comment',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({contest:CID,participant:MODAL.user,article:MODAL.title,text})});
- await reloadState();render();
-}
-function setTab(k){MTAB=k;renderModal()}
-async function openItem(it){
- MODAL={user:it.user,title:it.title,origin:it.origin,host:it.host,api:it.api,label:it.label,bytes:it.bytes,created:it.created};
- renderModal();
- const key=it.host+'::'+it.title;
- const cached=EXTRACT_CACHE[key];
- if(!cached||cached.extract==null){
-  try{
-   const d=await mw(it.api,{action:'query',prop:'extracts|pageimages',exintro:'1',explaintext:'1',
-    exchars:'700',piprop:'thumbnail',pithumbsize:'500',redirects:'1',titles:it.title});
-   const page=Object.values(d.query?.pages||{})[0];
-   EXTRACT_CACHE[key]={extract:page?.extract||'',thumb:page?.thumbnail?.source||(cached&&cached.thumb)||null};
-  }catch(e){EXTRACT_CACHE[key]={extract:'',thumb:(cached&&cached.thumb)||null,err:String(e.message||e)}}
-  if(MODAL&&MODAL.title===it.title&&MODAL.host===it.host)renderModal();
- }
-}
-function closeModal(){MODAL=null;renderModal()}
-// Вікіпедія забороняє показ сторінки історії в iframe (X-Frame-Options),
-// тому вкладку «Стаття» показуємо в iframe, а історію будуємо з REST API MediaWiki.
-const HIST_CACHE={},LEFT_PENDING=new Set();
-async function ensureLeftData(){
- if(!MODAL)return;
- const m=MODAL,key=m.host+'::'+m.title;
- const still=()=>MODAL&&MODAL.host===m.host&&MODAL.title===m.title;
- if(MTAB==='history'&&!HIST_CACHE[key]&&!LEFT_PENDING.has('h'+key)){
-  LEFT_PENDING.add('h'+key);
-  try{
-   let rows=[];
-   try{
-    // MediaWiki REST API: /w/rest.php/v1/page/{title}/history (до 3 сторінок по 20 правок)
-    let url=m.origin+'/w/rest.php/v1/page/'+encodeURIComponent(m.title.replace(/ /g,'_'))+'/history';
-    for(let g=0;g<3&&url;g++){
-     const r=await fetch(url);
-     if(!r.ok)throw new Error('HTTP '+r.status);
-     const d=await r.json();
-     (d.revisions||[]).forEach(x=>rows.push({revid:x.id,timestamp:x.timestamp,user:x.user?x.user.name:'',comment:x.comment||'',
-      diff:(x.delta!=null?x.delta:x.size),size:x.size}));
-     url=d.older||null;
-    }
-   }catch(e1){
-    const d=await mw(m.api,{action:'query',prop:'revisions',titles:m.title,rvprop:'ids|user|timestamp|comment|size',rvlimit:'50',redirects:'1'});
-    const page=Object.values(d.query?.pages||{})[0];
-    rows=(page&&page.revisions)||[];
-    for(let i=0;i<rows.length;i++)rows[i].diff=rows[i+1]?rows[i].size-rows[i+1].size:rows[i].size;
-   }
-   HIST_CACHE[key]={rows};
-  }catch(e){HIST_CACHE[key]={err:String(e.message||e)}}
-  LEFT_PENDING.delete('h'+key);if(still())renderModal();
- }
-}
-document.addEventListener('keydown',e=>{if(e.key==='Escape'&&MODAL)closeModal()});
-function leftHtml(ex){
- const m=MODAL;
- let h='<div class="md-tabs">';
- [['article',T.tab_article,T.tip_tab_article],['history',T.tab_history,T.tip_tab_history],['preview',T.tab_preview,T.tip_tab_preview]].forEach(x=>{
-  h+='<button data-tab="'+x[0]+'" title="'+esc(x[2])+'" class="'+(MTAB===x[0]?'on':'')+'">'+esc(x[1])+'</button>'});
- h+='<a class="hint" style="margin-left:auto" target="_blank" rel="noopener" title="'+esc(T.iframe_hint)+'" href="'+esc(articleLink(m.origin,m.title))+'">'+T.open_new+'</a></div>';
- if(MTAB==='preview'){
-  h+='<div class="md-pane">';
-  if(!ex||ex.extract==null)h+='<div class="hint">'+T.loading+'</div>';
-  else if(ex.err)h+='<div class="hint">'+esc(ex.err)+'</div>';
-  else{
-   if(ex.thumb)h+='<img src="'+esc(ex.thumb)+'" alt="" style="max-width:100%;border-radius:8px;margin-bottom:10px;display:block">';
-   h+='<h3 style="margin:0 0 8px">'+esc(m.title)+'</h3>';
-   h+='<div style="font-size:14px;line-height:1.55;white-space:pre-wrap">'+esc(ex.extract||'')+'</div>';
-  }
-  h+='</div>';
- }else if(MTAB==='history'){
-  const hs=HIST_CACHE[m.host+'::'+m.title];
-  h+='<div class="md-pane">';
-  if(!hs)h+='<div class="hint">'+T.loading+'</div>';
-  else if(hs.err)h+='<div class="hint">'+esc(hs.err)+'</div>';
-  else{
-   const enc=encodeURIComponent(m.title.replace(/ /g,'_'));
-   h+='<table><thead><tr><th>'+T.hist_date+'</th><th>'+T.hist_user+'</th><th>'+T.hist_size+'</th><th>'+T.hist_comment+'</th></tr></thead><tbody>';
-   hs.rows.forEach(r=>{
-    const d=(r.timestamp||'').replace('T',' ').replace('Z','').slice(0,16);
-    const col=r.diff>0?'var(--ok)':(r.diff<0?'var(--err)':'var(--mut)');
-    h+='<tr><td class="mono" style="font-size:12px;white-space:nowrap"><a class="wl" target="_blank" rel="noopener" href="'+esc(m.origin+'/w/index.php?title='+enc+'&diff=prev&oldid='+r.revid)+'">'+esc(d)+'</a></td>'
-     +'<td>'+esc(r.user||'')+'</td>'
-     +'<td class="mono" style="font-size:12px;color:'+col+'">'+(r.diff>0?'+':'')+fmtN(r.diff)+'</td>'
-     +'<td class="hint">'+esc(r.comment||'')+'</td></tr>';
-   });
-   h+='</tbody></table>';
-  }
-  h+='</div>';
- }else{
-  h+='<iframe class="md-frame" src="'+esc(articleLink(m.origin,m.title)+'?useskin=minerva')+'" sandbox="allow-same-origin allow-scripts allow-popups allow-popups-to-escape-sandbox"></iframe>';
- }
- return h;
-}
-function rightHtml(){
- const m=MODAL;
- const ad=slot(m.user,m.title);
- const vals=Object.values(ad.scores||{}).filter(v=>v!=null);
- const avg=vals.length?(vals.reduce((x,y)=>x+y,0)/vals.length):null;
- const my=(ad.scores||{})[JURY_LOGIN];
- const rev=isReviewed(m.user,m.title);
- const idx=modalIdx();
- const cid=idFor(m.user+'||'+m.title);
- let h='<div class="md-top">';
- h+='<button class="btn-s" title="'+esc(T.tip_prev)+'" onclick="stepModal(-1)"'+(idx>0?'':' disabled')+'>‹ '+T.prev+'</button>';
- h+='<button class="btn-s" title="'+esc(T.tip_next)+'" onclick="stepModal(1)"'+(idx>=0&&idx<CUR_LIST.length-1?'':' disabled')+'>'+T.next+' ›</button>';
- h+='<span class="hint mono">'+(idx>=0?(idx+1)+' / '+CUR_LIST.length:'')+'</span>';
- h+='<button class="btn-s" style="margin-left:auto;padding:4px 10px" title="'+esc(T.tip_close)+'" onclick="closeModal()">✕</button></div>';
- h+='<h3 style="margin:4px 0 6px">'+esc(m.title)+'</h3>';
- h+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">';
- h+='<span class="chip" style="background:'+(m.created?'#e6f4ea':'var(--acc-soft)')+';color:'+(m.created?'#1d7a4f':'var(--acc)')+'">'+(m.created?T.created:T.expanded)+'</span>';
- h+='<span class="chip '+(rev?'st-ok':'st-todo')+'"'+(rev&&!legacyDone(m.user)?' style="cursor:pointer" title="'+esc(T.tip_unrev)+'" onclick="toggleReviewed()"':' title="'+esc(T.tip_status)+'"')+'>'+(rev?'✓ '+T.reviewed:'● '+T.unreviewed)+'</span>';
- h+='<span class="hint mono">'+esc(m.label)+' · +'+fmtN(m.bytes)+(LANG==='uk'?' Б':' B')+'</span></div>';
- h+='<div class="hint">'+esc(m.user)+'</div>';
- if((ad.assigned||[]).length)h+='<div class="hint" style="margin-top:4px">'+T.assigned_to+': '+ad.assigned.map(l=>esc(juryName(l))).join(', ')+'</div>';
- h+='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px">';
- h+='<label class="hint" style="font-size:12px" title="'+esc(T.tip_my_score)+'">'+T.th_my+':</label>';
- h+='<input type="number" step="0.1" title="'+esc(T.tip_my_score)+'" style="width:70px" value="'+(my??'')+'" onchange="saveScoreM(this.value)">';
- h+='<span class="hint mono">'+T.th_avg+': '+(avg!=null?avg.toFixed(2):'—')+(vals.length?' ('+vals.length+' '+T.scores_n+')':'')+'</span></div>';
- h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">';
- h+='<button class="btn-p" title="'+esc(rev?T.tip_next_btn:T.tip_rev_next)+'" onclick="reviewAndNext()">'+(rev?T.next+' ›':T.rev_next)+'</button></div>';
- h+='<div style="margin-top:14px">';
- (ad.comments||[]).forEach(c=>{h+='<div style="padding:5px 0;border-bottom:1px dashed var(--line)"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span><div>'+esc(c.text)+'</div></div>'});
- if(!(ad.comments||[]).length)h+='<div class="hint" style="font-size:12px">'+T.no_comments+'</div>';
- h+='<div style="display:flex;gap:8px;margin-top:8px"><input class="md-cm" id="cm_'+cid+'" placeholder="'+esc(T.comment_ph)+'" onkeydown="if(event.keyCode===13)saveCommentM()"><button class="btn-p" title="'+esc(T.tip_comment)+'" onclick="saveCommentM()">'+T.save+'</button></div>';
- h+='</div>';
- return h;
-}
-function renderModal(){
- let el=document.getElementById('artModal');
- if(!MODAL){if(el)el.remove();return}
- if(!el){
-  el=document.createElement('div');el.id='artModal';
-  el.innerHTML='<div class="md-back" onclick="if(event.target===this)closeModal()"><div class="md-box"><div class="md-left" id="mdLeft"></div><div class="md-right" id="mdRight"></div></div></div>';
-  document.body.appendChild(el);
- }
- const key=MODAL.host+'::'+MODAL.title;
- const ex=EXTRACT_CACHE[key];
- // ліва частина перебудовується лише при зміні статті/вкладки — щоб iframe не перезавантажувався
- const left=document.getElementById('mdLeft');
- const lk=key+'|'+MTAB+'|'+(MTAB==='preview'?(ex&&ex.extract!=null?'1':'0'):(MTAB==='article'?'':(HIST_CACHE[key]?'1':'0')));
- if(left.dataset.k!==lk){
-  left.dataset.k=lk;left.innerHTML=leftHtml(ex);
-  left.querySelectorAll('[data-tab]').forEach(b=>{b.onclick=()=>setTab(b.dataset.tab)});
- }
- const rt=document.getElementById('mdRight');
- const old=rt.querySelector('.md-cm');
- const draft=old?old.value:'';const hadFocus=!!old&&document.activeElement===old;
- const same=rt.dataset.k===key;
- rt.innerHTML=rightHtml();rt.dataset.k=key;
- const nw=rt.querySelector('.md-cm');
- if(nw&&same){nw.value=draft;if(hadFocus)nw.focus()}
- ensureLeftData();
-}
-function articleQuality(pa,user,allowed){
- if(!pa)return{quality:0,n:0};
- const avgs=[];let n=0;
- Object.entries(pa).forEach(([ttl,a])=>{
-  if(allowed&&!allowed.has(ttl))return;
-  const vals=Object.values(a.scores||{}).filter(v=>v!=null);
-  if(vals.length){avgs.push(vals.reduce((x,y)=>x+y,0)/vals.length);n+=vals.length}
- });
- if(!avgs.length&&user){const lv=legacyVals(user);if(lv.length)return{quality:lv.reduce((x,y)=>x+y,0)/lv.length,n:lv.length}}
- return{quality:avgs.length?avgs.reduce((x,y)=>x+y,0)/avgs.length:0,n};
-}
-function evalFormula(f,v){
- if(!f||!String(f).trim())return null;
- const cleaned=f.replace(/\\b(bytes|edits|articles|quality|created|expanded)\\b/g,'1');
- if(!/^[\\d\\s+\\-*/().,]+$/.test(cleaned))return null;
- try{const fn=new Function('bytes','edits','articles','quality','created','expanded','return ('+f+')');
-  const r=fn(v.bytes,v.edits,v.articles,v.quality,v.created||0,v.expanded||0);
-  return typeof r==='number'&&!isNaN(r)?r:null}catch(e){return null}
-}
-// розбивка внеску на нові та доповнені статті (з уже збережених списків)
-function splitStats(r){
- const s={created:0,expanded:0,bc:0,be:0};
- if(!r)return s;
- Object.values(r.perProject||{}).forEach(pp=>(pp.list||[]).forEach(it=>{
-  if(it.created){s.created++;s.bc+=it.bytes}else{s.expanded++;s.be+=it.bytes}}));
- return s;
-}
-function partTitles(r){
- const s=new Set();
- if(r)Object.values(r.perProject||{}).forEach(pp=>(pp.list||[]).forEach(it=>{if(inScope(it))s.add(it.title)}));
- return[...s];
-}
-function fmtN(n){return n==null?'—':n.toLocaleString(LANG==='uk'?'uk-UA':'en-GB')}
-function idFor(u){return btoa(unescape(encodeURIComponent(u))).replace(/[^a-z0-9]/gi,'')}
-function contribLink(origin,user){return origin+'/wiki/Special:Contributions/'+encodeURIComponent(user)}
-
-let ROWS_CUR=[];
-function toggleArt(i){const u=ROWS_CUR[i].user;ARTOPEN=ARTOPEN===u?null:u;SCROLL_RESET=true;render()}
-function render(){
- const el=document.getElementById('tbl');if(!CONTEST){el.innerHTML='';return}
- const oldCar=el.querySelector('.carousel');
- const keepScroll=(oldCar&&!SCROLL_RESET)?oldCar.scrollLeft:0;SCROLL_RESET=false;
- CUR_LIST=[];
- const HAS_F=!!(CONTEST.formula&&CONTEST.formula.trim());
- const allRows=CONTEST.participants.map(user=>{
-  const r=RESULTS?RESULTS[user]:null;const pa=ASSESS[user]||{};
-  const{quality,n}=articleQuality(pa,user,(SCOPE!=='all'&&r)?new Set(partTitles(r)):null);
-  const sp=splitStats(r);
-  const score=r?evalFormula(CONTEST.formula,{bytes:r.bytes,edits:r.edits,articles:r.articles,quality,created:sp.created,expanded:sp.expanded}):null;
-  const titles=partTitles(r);
-  const done=titles.filter(t=>isReviewed(user,t)).length;
-  const mineT=titles.filter(t=>isMine(user,t));
-  const mineDone=mineT.filter(t=>isReviewed(user,t)).length;
-  return{user,r,pa,quality,n,score,sp,total:IS_JURY?mineT.length:titles.length,done:IS_JURY?mineDone:done,mine:mineT.length,mineDone};
- }).sort((x,y)=>(QUAL&&!IS_JURY&&HAS_F)?((y.score??-1e18)-(x.score??-1e18)):((y.r?y.r.bytes:-1)-(x.r?x.r.bytes:-1)));
- const hiddenN=allRows.filter(x=>x.r&&x.r.bytes<MIN_BYTES).length;
- const rows=allRows.filter(x=>!(x.r&&x.r.bytes<MIN_BYTES)&&!(IS_JURY&&QUAL&&x.r&&!x.mine));
- ROWS_CUR=rows;
- const maxB=Math.max(1,...rows.map(r=>r.r?r.r.bytes:0));
- const th=(lbl,tip)=>'<th title="'+esc(tip||'')+'">'+esc(lbl)+'</th>';
- let h='<table><thead><tr><th>#</th>'+th(T.th_u,T.tip_th_u);
- if(IS_JURY){
-  h+=th(T.th_b,T.tip_th_b)+th(T.th_created_n,T.tip_th_created_n)+th(T.th_expanded_n,T.tip_th_expanded_n)+th(T.th_avg,T.tip_th_avg)+th(T.th_progress,T.tip_th_progress);
- }else{
-  if(QUANT){h+=th(T.th_b,T.tip_th_b);projects.forEach(p=>h+='<th>'+esc(p.label)+'</th>');h+=th(T.th_e,T.tip_th_e)+th(T.th_split,T.tip_th_split)}
-  if(QUAL){h+=th(T.th_avg,T.tip_th_avg);if(HAS_F)h+=th(T.th_score,T.tip_th_score);h+=th(T.th_progress,T.tip_th_progress)}
- }
- h+='<th></th></tr></thead><tbody>';
- if(!rows.length)h+='<tr><td colspan="99" class="hint" style="padding:20px">'+T.no_parts+'</td></tr>';
- rows.forEach((row,i)=>{
-  h+='<tr><td class="mono" style="color:var(--mut)">'+(i+1)+'</td><td>';
-  h+='<a class="wl" title="'+esc(T.tip_user_link)+'" target="_blank" rel="noopener" href="'+contribLink(projects[0]?projects[0].origin:'',row.user)+'">'+esc(row.user)+' ↗</a>';
-  h+='<div style="display:flex;gap:8px">'+projects.map(p=>'<a class="hint" target="_blank" rel="noopener" href="'+contribLink(p.origin,row.user)+'">'+esc(p.label)+' ↗</a>').join('')+'</div></td>';
+diff --git a/README.md b/README.md
+index 8d3d203..1379264 100644
+--- a/README.md
++++ b/README.md
+@@ -13,6 +13,12 @@
+   автоматично показує кількісний
+ - **Шаблон конкурсу**: вставте посилання на шаблон — інструмент знайде всі
+   статті кампанії та автоматично витягне список учасників у межах дат
++- **Мінімум байтів для доповнення**: адмін задає в налаштуваннях конкурсу, скільки
++  байтів має додати учасник, щоб доповнення статті потрапило на перевірку журі
++  (нові статті не відсіюються; 0 = вимкнено)
++- **Рейтинг за балами журі**: таблиця сортується за середнім балом окремо за нові та
++  окремо за доповнені статті (клік по заголовку, діє й на CSV), а блок «Найвищі бали журі»
++  показує топ статей двома стовпцями з стовпчиками
+ - **Коментарі журі** зберігаються з автором і датою
+ - Список учасників із посиланнями на внесок **у новій вкладці**
+ - **Експорт CSV** для протоколу журі (з BOM, відкривається в Excel)
+diff --git a/app.py b/app.py
+index cda2303..44a4b1c 100644
+--- a/app.py
++++ b/app.py
+@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS contest_jury(
+   contest_id TEXT, login TEXT, PRIMARY KEY(contest_id, login));
+ """
+ 
++# раніше мінімальний внесок учасника був зашитий (1000 Б) для всіх конкурсів;
++# тепер це налаштування конкурсу, а значення нижче лише зберігає поведінку вже наявних конкурсів
++LEGACY_MIN_BYTES = 1000
++
+ def init_db():
+     con = sqlite3.connect(DB_PATH)
+     had_reviews = con.execute(
+@@ -100,6 +104,17 @@ def init_db():
+         con.execute("ALTER TABLE contests ADD COLUMN tpl_talk_only INTEGER DEFAULT 0")
+     if "review_scope" not in cols:
+         con.execute("ALTER TABLE contests ADD COLUMN review_scope TEXT DEFAULT 'all'")
++    if "min_expand" not in cols:
++        # мінімум доданих байтів, щоб доповнення статті потрапило на перевірку журі (0 = без обмеження)
++        con.execute("ALTER TABLE contests ADD COLUMN min_expand INTEGER DEFAULT 0")
++    if "min_bytes" not in cols:
++        # мінімальний внесок учасника (сума доданих байтів); 0 = без обмеження
++        con.execute("ALTER TABLE contests ADD COLUMN min_bytes INTEGER DEFAULT 0")
++        # наявні конкурси мали поріг 1000 Б — зберігаємо їхню поведінку, адмін може змінити
++        con.execute("UPDATE contests SET min_bytes=?", (LEGACY_MIN_BYTES,))
++    if "min_created" not in cols:
++        # мінімум байтів для нової (започаткованої) статті (0 = без обмеження)
++        con.execute("ALTER TABLE contests ADD COLUMN min_created INTEGER DEFAULT 0")
+     if not had_cj:
+         # раніше журі було спільним для всіх конкурсів: щоб не порушити перевірки, що вже тривають,
+         # додаємо всіх наявних журі до всіх наявних конкурсів (адмін зможе звузити склад)
+@@ -120,8 +135,6 @@ _OPS = {ast.Add: operator.add, ast.Sub: operator.sub,
+         ast.USub: operator.neg, ast.UAdd: operator.pos,
+         ast.Pow: operator.pow}
+ FORMULA_VARS = ("bytes", "edits", "articles", "quality", "created", "expanded")
+-# мінімальний внесок: учасники з меншою сумою доданих байтів не потрапляють у рейтинг
+-MIN_BYTES = 1000
+ 
+ def eval_formula(expr, variables):
+     def _ev(node):
+@@ -553,6 +566,83 @@ _NEW = {
+ for _l, _d in _NEW.items():
+     T[_l].update(_d)
+ 
++_RANK = {
++ "uk": dict(
++   min_expand="Мінімум байтів для доповненої статті",
++   tip_min_expand="Доповнення, де учасник додав менше байтів, не потрапляють на перевірку журі. 0 = без обмеження",
++   min_expand_h="Доповнення з меншим приростом відсіюються з розподілу, переліку статей, прогресу й якості (так само, як учасники нижче мінімального внеску). Нові статті не відсіюються; кількісний внесок не змінюється. 0 = вимкнено.",
++   min_expand_chip="Мін. доповнення:", bytes_unit="Б",
++   min_bytes="Мінімальний внесок учасника (байтів)",
++   tip_min_bytes="Учасники, які додали за період менше байтів, не потрапляють у рейтинг і на перевірку. 0 = без обмеження",
++   min_bytes_h="Сума доданих байтів учасника. Менший внесок — учасника приховано з таблиці, розподілу й експорту. 0 = вимкнено.",
++   min_bytes_chip="Мін. внесок:",
++   min_created="Мінімум байтів для нової статті",
++   tip_min_created="Нові (започатковані) статті, у яких менше байтів, не потрапляють на перевірку журі. 0 = без обмеження",
++   min_created_h="Працює так само, як поріг для доповнень, але для нових статей (за правилами, напр., 3500 Б). Рахуються додані учасником байти.",
++   min_created_chip="Мін. нова стаття:",
++   hidden_exp="Приховано статей, менших за мінімум (нові + доповнення)",
++   th_avg_c="Бал: нові", th_avg_e="Бал: доповнені",
++   tip_th_avg_c="Середній бал журі за нові статті учасника. Клікніть, щоб відсортувати",
++   tip_th_avg_e="Середній бал журі за доповнені статті учасника. Клікніть, щоб відсортувати",
++   top_title="Найвищі бали журі", top_created="Нові статті", top_expanded="Доповнені статті",
++   top_show="Показати", top_none="Оцінених статей ще немає",
++   top_h="Рейтинг статей за середнім балом журі — окремо створені та окремо доповнені.",
++   me_warn="⚠ Після збереження з перевірки випаде оцінених статей: {n}. Оцінки лишаться в базі, але не враховуватимуться в якості й балах.",
++   me_ok="Оцінених статей, що випадуть, немає.",
++   me_confirm="Відсіяти оцінені статті ({n})? Їхні оцінки більше не враховуватимуться в якості й балах (у базі вони лишаться).",
++   me_more="…та ще"),
++ "en": dict(
++   min_expand="Minimum bytes for an expanded article",
++   tip_min_expand="Expansions where the participant added fewer bytes are not sent to the jury. 0 = no limit",
++   min_expand_h="Expansions below the threshold are dropped from distribution, article lists, progress and quality (the same way participants below the minimum contribution are). New articles are never dropped; quantitative contribution is unchanged. 0 = off.",
++   min_expand_chip="Min. expansion:", bytes_unit="B",
++   min_bytes="Minimum participant contribution (bytes)",
++   tip_min_bytes="Participants who added fewer bytes in the period are left out of the ranking and review. 0 = no limit",
++   min_bytes_h="The participant's total added bytes. Smaller contributions are hidden from the table, distribution and export. 0 = off.",
++   min_bytes_chip="Min. contribution:",
++   min_created="Minimum bytes for a new article",
++   tip_min_created="New (started) articles with fewer bytes are not sent to the jury. 0 = no limit",
++   min_created_h="Works like the expansion threshold, but for new articles (e.g. 3500 B per the rules). Counts the bytes added by the participant.",
++   min_created_chip="Min. new article:",
++   hidden_exp="Articles hidden for being below the minimum (new + expansions)",
++   th_avg_c="Score: new", th_avg_e="Score: expanded",
++   tip_th_avg_c="Average jury score for the participant's new articles. Click to sort",
++   tip_th_avg_e="Average jury score for the participant's expanded articles. Click to sort",
++   top_title="Top jury scores", top_created="New articles", top_expanded="Expanded articles",
++   top_show="Show", top_none="No scored articles yet",
++   top_h="Articles ranked by average jury score — new and expanded separately.",
++   me_warn="⚠ After saving, scored articles that will drop out of the review: {n}. The scores stay in the database but will not count toward quality and scores.",
++   me_ok="No scored articles will drop out.",
++   me_confirm="Drop scored articles ({n})? Their scores will stop counting toward quality and scores (they stay in the database).",
++   me_more="…and more:"),
++ "pl": dict(
++   min_expand="Minimum bajtów dla rozbudowanego artykułu",
++   tip_min_expand="Rozbudowy, w których uczestnik dodał mniej bajtów, nie trafiają do oceny jury. 0 = bez limitu",
++   min_expand_h="Rozbudowy poniżej progu są pomijane w podziale, liście artykułów, postępie i jakości (tak jak uczestnicy poniżej minimalnego wkładu). Nowe artykuły nie są pomijane; wkład ilościowy się nie zmienia. 0 = wyłączone.",
++   min_expand_chip="Min. rozbudowa:", bytes_unit="B",
++   min_bytes="Minimalny wkład uczestnika (bajty)",
++   tip_min_bytes="Uczestnicy, którzy dodali mniej bajtów w okresie, nie trafiają do rankingu ani oceny. 0 = bez limitu",
++   min_bytes_h="Suma dodanych bajtów uczestnika. Mniejszy wkład — uczestnik ukryty w tabeli, podziale i eksporcie. 0 = wyłączone.",
++   min_bytes_chip="Min. wkład:",
++   min_created="Minimum bajtów dla nowego artykułu",
++   tip_min_created="Nowe artykuły z mniejszą liczbą bajtów nie trafiają do oceny jury. 0 = bez limitu",
++   min_created_h="Działa jak próg dla rozbudów, ale dla nowych artykułów (np. 3500 B wg regulaminu). Liczą się bajty dodane przez uczestnika.",
++   min_created_chip="Min. nowy artykuł:",
++   hidden_exp="Ukryte artykuły poniżej minimum (nowe + rozbudowy)",
++   th_avg_c="Ocena: nowe", th_avg_e="Ocena: rozbudowane",
++   tip_th_avg_c="Średnia ocena jury za nowe artykuły uczestnika. Kliknij, aby sortować",
++   tip_th_avg_e="Średnia ocena jury za rozbudowane artykuły uczestnika. Kliknij, aby sortować",
++   top_title="Najwyższe oceny jury", top_created="Nowe artykuły", top_expanded="Rozbudowane artykuły",
++   top_show="Pokaż", top_none="Brak ocenionych artykułów",
++   top_h="Artykuły według średniej oceny jury — osobno nowe i rozbudowane.",
++   me_warn="⚠ Po zapisaniu z oceny wypadną ocenione artykuły: {n}. Oceny zostaną w bazie, ale nie będą liczone w jakości i wynikach.",
++   me_ok="Żadne ocenione artykuły nie wypadną.",
++   me_confirm="Pominąć ocenione artykuły ({n})? Ich oceny przestaną się liczyć w jakości i wynikach (zostaną w bazie).",
++   me_more="…i jeszcze:"),
++}
++for _l, _d in _RANK.items():
++    T[_l].update(_d)
++
+ def lang():
+     l = request.args.get("lang") or session.get("lang") or "uk"
+     if l not in T:
+@@ -941,9 +1031,62 @@ let SCROLL_RESET=false;
+ let MTAB='article';   // 'preview' | 'article' | 'history'
+ const JURY_LIST={{juryjson|safe}};
+ const SCOPE={{((contest.review_scope or 'all') if contest else 'all')|tojson}};
+-const MIN_BYTES={{min_bytes}}; // мінімальний внесок для участі в рейтингу
++const MIN_BYTES={{((contest.min_bytes or 0) if contest else 0)|int}}; // мінімальний внесок учасника (налаштування конкурсу; 0 = вимкнено)
++const MIN_EXP={{((contest.min_expand or 0) if contest else 0)|int}}; // мінімум доданих байтів, щоб доповнення потрапило на перевірку
++const MIN_NEW={{((contest.min_created or 0) if contest else 0)|int}}; // мінімум байтів для нової статті
++let SORT_KEY=null; // null (за замовчуванням) | 'qc' (бал нових) | 'qe' (бал доповнених)
++let TOPN=10;
++const BU=LANG==='uk'?' Б':' B';
+ const LEGACY={{ljson|safe}}; // оцінки/коментарі з попередньої версії (рівень учасника)
+-function inScope(it){return SCOPE==='all'||(SCOPE==='created')===!!it.created}
++function inScope(it){
++ if((it.bytes||0)<(it.created?MIN_NEW:MIN_EXP))return false;
++ return SCOPE==='all'||(SCOPE==='created')===!!it.created}
++function setSort(k){SORT_KEY=SORT_KEY===k?null:k;ARTOPEN=null;render()}
++function setTopN(n){TOPN=Number(n)||10;render()}
++// середній бал журі окремо для нових і доповнених статей (у межах обсягу перевірки)
++function kindQuality(r,user){
++ const acc={created:[],expanded:[]};const seen=new Set();
++ if(r)Object.values(r.perProject||{}).forEach(pp=>(pp.list||[]).forEach(it=>{
++  if(!inScope(it)||seen.has(it.title))return;seen.add(it.title);
++  const vals=Object.values(slot(user,it.title).scores||{}).filter(v=>v!=null);
++  if(vals.length)acc[it.created?'created':'expanded'].push(vals.reduce((x,y)=>x+y,0)/vals.length)}));
++ const m=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
++ return{qc:m(acc.created),qcn:acc.created.length,qe:m(acc.expanded),qen:acc.expanded.length};
++}
++// рейтинг статей за середнім балом журі: окремо створені й окремо доповнені
++function topArticles(rows){
++ const out={created:[],expanded:[]};
++ rows.forEach(row=>projects.forEach(p=>{
++  const pp=row.r?row.r.perProject[p.host]:null;
++  (pp&&pp.list?pp.list:[]).filter(inScope).forEach(it=>{
++   const vals=Object.values(slot(row.user,it.title).scores||{}).filter(v=>v!=null);
++   if(!vals.length)return;
++   out[it.created?'created':'expanded'].push({user:row.user,title:it.title,origin:p.origin,bytes:it.bytes,
++    avg:vals.reduce((x,y)=>x+y,0)/vals.length,n:vals.length});
++  })}));
++ const cmp=(a,b)=>(b.avg-a.avg)||(b.n-a.n)||(b.bytes-a.bytes);
++ out.created.sort(cmp);out.expanded.sort(cmp);return out;
++}
++function topHtml(rows){
++ const tp=topArticles(rows);
++ const mx=Math.max(1,...tp.created.concat(tp.expanded).map(x=>x.avg));
++ const col=(lbl,list,clr)=>{
++  let h='<div style="flex:1;min-width:300px"><div class="lbl" style="margin:0 0 6px;color:'+clr+'">'+esc(lbl)+' <span class="hint">('+list.length+')</span></div>';
++  if(!list.length)return h+'<div class="hint">'+esc(T.top_none)+'</div></div>';
++  list.slice(0,TOPN).forEach((x,i)=>{
++   h+='<div style="display:grid;grid-template-columns:22px 1fr 44px;gap:8px;align-items:center;padding:3px 0">'
++    +'<span class="mono hint">'+(i+1)+'</span><div style="min-width:0">'
++    +'<a class="wl" target="_blank" rel="noopener" href="'+articleLink(x.origin,x.title)+'" style="display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(x.title)+'</a>'
++    +'<div class="hint" style="font-size:11px">'+esc(x.user)+' · +'+fmtN(x.bytes)+BU+' · '+x.n+' '+esc(T.scores_n)+'</div>'
++    +'<div class="bar"><i style="width:'+(x.avg/mx*100)+'%;background:'+clr+'"></i></div></div>'
++    +'<span class="mono" style="font-weight:700;text-align:right">'+x.avg.toFixed(2)+'</span></div>'});
++  return h+'</div>'};
++ let h='<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px"><h3 style="margin:0">'+esc(T.top_title)+'</h3>'
++  +'<span class="hint">'+esc(T.top_h)+'</span><span style="margin-left:auto" class="hint">'+esc(T.top_show)+' <select onchange="setTopN(this.value)" style="width:auto;padding:2px 6px">'
++  +[5,10,25,50].map(n=>'<option value="'+n+'"'+(n===TOPN?' selected':'')+'>'+n+'</option>').join('')+'</select></span></div>';
++ h+='<div style="display:flex;flex-wrap:wrap;gap:24px">'+col(T.top_created,tp.created,'#1d7a4f')+col(T.top_expanded,tp.expanded,'var(--acc)')+'</div>';
++ return h;
++}
+ function legacyDone(user){const l=LEGACY[user];return !!(l&&(Object.keys(l.scores||{}).length||(l.comments||[]).length))}
+ function legacyVals(user){const l=LEGACY[user];return l?Object.values(l.scores||{}).filter(v=>v!=null):[]}
+ function setArtFilter(f){ART_FILTER=f;SCROLL_RESET=true;render()}
+@@ -1251,26 +1394,29 @@ function render(){
+  const HAS_F=!!(CONTEST.formula&&CONTEST.formula.trim());
+  const allRows=CONTEST.participants.map(user=>{
+   const r=RESULTS?RESULTS[user]:null;const pa=ASSESS[user]||{};
+-  const{quality,n}=articleQuality(pa,user,(SCOPE!=='all'&&r)?new Set(partTitles(r)):null);
+-  const sp=splitStats(r);
++  const{quality,n}=articleQuality(pa,user,((SCOPE!=='all'||MIN_EXP>0||MIN_NEW>0)&&r)?new Set(partTitles(r)):null);
++  const sp=splitStats(r);const kq=kindQuality(r,user);
+   const score=r?evalFormula(CONTEST.formula,{bytes:r.bytes,edits:r.edits,articles:r.articles,quality,created:sp.created,expanded:sp.expanded}):null;
+   const titles=partTitles(r);
+   const done=titles.filter(t=>isReviewed(user,t)).length;
+   const mineT=titles.filter(t=>isMine(user,t));
+   const mineDone=mineT.filter(t=>isReviewed(user,t)).length;
+-  return{user,r,pa,quality,n,score,sp,total:IS_JURY?mineT.length:titles.length,done:IS_JURY?mineDone:done,mine:mineT.length,mineDone};
+- }).sort((x,y)=>(QUAL&&!IS_JURY&&HAS_F)?((y.score??-1e18)-(x.score??-1e18)):((y.r?y.r.bytes:-1)-(x.r?x.r.bytes:-1)));
++  return{user,r,pa,quality,n,score,sp,kq,total:IS_JURY?mineT.length:titles.length,done:IS_JURY?mineDone:done,mine:mineT.length,mineDone};
++ }).sort((x,y)=>{
++  if(QUAL&&SORT_KEY){const a=x.kq[SORT_KEY]??-1e18,b=y.kq[SORT_KEY]??-1e18;if(a!==b)return b-a}
++  return(QUAL&&!IS_JURY&&HAS_F)?((y.score??-1e18)-(x.score??-1e18)):((y.r?y.r.bytes:-1)-(x.r?x.r.bytes:-1))});
+  const hiddenN=allRows.filter(x=>x.r&&x.r.bytes<MIN_BYTES).length;
+  const rows=allRows.filter(x=>!(x.r&&x.r.bytes<MIN_BYTES)&&!(IS_JURY&&QUAL&&x.r&&!x.mine));
+  ROWS_CUR=rows;
+  const maxB=Math.max(1,...rows.map(r=>r.r?r.r.bytes:0));
+  const th=(lbl,tip)=>'<th title="'+esc(tip||'')+'">'+esc(lbl)+'</th>';
++ const thS=(lbl,tip,k)=>'<th title="'+esc(tip||'')+'" style="cursor:pointer;user-select:none;white-space:nowrap" onclick="setSort(\\''+k+'\\')">'+esc(lbl)+(SORT_KEY===k?' ▼':' ⇅')+'</th>';
+  let h='<table><thead><tr><th>#</th>'+th(T.th_u,T.tip_th_u);
   if(IS_JURY){
-   h+='<td><div class="mono" style="font-weight:700">'+(row.r?'+'+fmtN(row.r.bytes)+(LANG==='uk'?' Б':' B'):'—')+'</div></td>';
-   h+='<td class="mono" style="font-size:12px;color:#1d7a4f">'+(row.r?fmtN(row.sp.created):'—')+'</td>';
-   h+='<td class="mono" style="font-size:12px">'+(row.r?fmtN(row.sp.expanded):'—')+'</td>';
-   h+='<td class="mono">'+(row.n?row.quality.toFixed(2):'—')+'<div class="hint">'+row.n+' '+T.scores_n+'</div></td>';
-   h+='<td class="mono" style="font-size:12px">'+(row.total?row.done+' / '+row.total:'—')+'</td>';
+-  h+=th(T.th_b,T.tip_th_b)+th(T.th_created_n,T.tip_th_created_n)+th(T.th_expanded_n,T.tip_th_expanded_n)+th(T.th_avg,T.tip_th_avg)+th(T.th_progress,T.tip_th_progress);
++  h+=th(T.th_b,T.tip_th_b)+th(T.th_created_n,T.tip_th_created_n)+th(T.th_expanded_n,T.tip_th_expanded_n)+th(T.th_avg,T.tip_th_avg)+thS(T.th_avg_c,T.tip_th_avg_c,'qc')+thS(T.th_avg_e,T.tip_th_avg_e,'qe')+th(T.th_progress,T.tip_th_progress);
+  }else{
+   if(QUANT){h+=th(T.th_b,T.tip_th_b);projects.forEach(p=>h+='<th>'+esc(p.label)+'</th>');h+=th(T.th_e,T.tip_th_e)+th(T.th_split,T.tip_th_split)}
+-  if(QUAL){h+=th(T.th_avg,T.tip_th_avg);if(HAS_F)h+=th(T.th_score,T.tip_th_score);h+=th(T.th_progress,T.tip_th_progress)}
++  if(QUAL){h+=th(T.th_avg,T.tip_th_avg)+thS(T.th_avg_c,T.tip_th_avg_c,'qc')+thS(T.th_avg_e,T.tip_th_avg_e,'qe');if(HAS_F)h+=th(T.th_score,T.tip_th_score);h+=th(T.th_progress,T.tip_th_progress)}
   }
-  if(QUANT&&!IS_JURY){
-   h+='<td><div class="mono" style="font-weight:700">'+(row.r?'+'+fmtN(row.r.bytes)+(LANG==='uk'?' Б':' B'):'—')+'</div>';
-   h+='<div class="bar"><i style="width:'+((row.r?row.r.bytes:0)/maxB*100)+'%"></i></div></td>';
-   projects.forEach(p=>{const pp=row.r?row.r.perProject[p.host]:null;
-    h+='<td class="mono" style="font-size:12px">'+(pp?(pp.err?'<span style="color:var(--err)" title="'+esc(pp.err)+'">'+T.err+'</span>':'+'+fmtN(pp.bytes)):'—')+'</td>'});
-   h+='<td class="mono" style="font-size:12px">'+(row.r?fmtN(row.r.edits)+' / '+fmtN(row.r.articles):'—')+'</td>';
-   h+='<td class="mono" style="font-size:12px">'+(row.r?'<span style="color:#1d7a4f">'+fmtN(row.sp.created)+'</span> / '+fmtN(row.sp.expanded)
-    +'<div class="hint">+'+fmtN(row.sp.bc)+' / +'+fmtN(row.sp.be)+'</div>':'—')+'</td>';
-  }
-  if(QUAL&&!IS_JURY){
-   h+='<td class="mono">'+(row.n?row.quality.toFixed(2):'—')+'<div class="hint">'+row.n+' '+T.scores_n+'</div></td>';
-   if(HAS_F)h+='<td><span class="mono" style="font-weight:700;color:var(--gold);font-size:15px">'+(row.score!=null?row.score.toFixed(2):'—')+'</span></td>';
-   h+='<td class="mono" style="font-size:12px">'+(row.total?row.done+' / '+row.total:'—')
-    +(row.mine&&!IS_JURY?'<div class="hint">'+T.my_assigned+': '+row.mineDone+' / '+row.mine+'</div>':'')+'</td>';
-  }
-  h+='<td>'+(QUAL?'<button class="btn-s" style="padding:4px 10px;font-size:12px" title="'+esc(T.tip_articles_btn)+'" onclick="toggleArt('+i+')">'+T.articles_btn+(row.r?' ('+(IS_JURY?row.mine:row.r.articles)+')':'')+'</button>':'')+'</td></tr>';
-  if(QUAL&&ARTOPEN===row.user){
-   h+='<tr><td colspan="99" style="background:#fafbfc"><div style="max-width:1000px">';
-   if(legacyDone(row.user)){
-    const lg=LEGACY[row.user],lv=legacyVals(row.user);
-    h+='<div style="margin-bottom:10px;padding:10px 12px;border-radius:10px;background:#e6f4ea"><b>✓ '+T.legacy_title+'</b>'
-     +(lv.length?' · '+T.th_avg+': '+(lv.reduce((x,y)=>x+y,0)/lv.length).toFixed(2)+' ('+lv.length+' '+T.scores_n+')':'');
-    (lg.comments||[]).forEach(c=>{h+='<div style="padding:3px 0"><b>'+esc(c.jury)+'</b> <span class="hint mono">'+esc(c.date)+'</span> '+esc(c.text)+'</div>'});
-    h+='<div class="hint" style="margin-top:4px">'+T.legacy_h+'</div></div>';
+  h+='<th></th></tr></thead><tbody>';
+  if(!rows.length)h+='<tr><td colspan="99" class="hint" style="padding:20px">'+T.no_parts+'</td></tr>';
+@@ -1283,6 +1429,8 @@ function render(){
+    h+='<td class="mono" style="font-size:12px;color:#1d7a4f">'+(row.r?fmtN(row.sp.created):'—')+'</td>';
+    h+='<td class="mono" style="font-size:12px">'+(row.r?fmtN(row.sp.expanded):'—')+'</td>';
+    h+='<td class="mono">'+(row.n?row.quality.toFixed(2):'—')+'<div class="hint">'+row.n+' '+T.scores_n+'</div></td>';
++   h+='<td class="mono">'+(row.kq.qc!=null?row.kq.qc.toFixed(2):'—')+'<div class="hint">'+row.kq.qcn+' '+T.th_created_n.toLowerCase()+'</div></td>';
++   h+='<td class="mono">'+(row.kq.qe!=null?row.kq.qe.toFixed(2):'—')+'<div class="hint">'+row.kq.qen+' '+T.th_expanded_n.toLowerCase()+'</div></td>';
+    h+='<td class="mono" style="font-size:12px">'+(row.total?row.done+' / '+row.total:'—')+'</td>';
    }
-   const items=[];
-   projects.forEach(p=>{const pp=row.r?row.r.perProject[p.host]:null;
-    (pp&&pp.list?pp.list:[]).filter(inScope).filter(it=>!IS_JURY||isMine(row.user,it.title)).forEach(it=>items.push({...it,origin:p.origin,label:p.label,host:p.host,api:p.api}))});
-   // спершу неперевірені мною, серед них — призначені мені, далі за приростом байтів
-   items.sort((a,b2)=>{
-    const ra=isReviewed(row.user,a.title)?1:0,rb=isReviewed(row.user,b2.title)?1:0;
-    if(ra!==rb)return ra-rb;
-    const ma=isMine(row.user,a.title)?1:0,mb=isMine(row.user,b2.title)?1:0;
-    if(ma!==mb)return mb-ma;
-    return b2.bytes-a.bytes;
-   });
-   if(!items.length)h+='<div class="hint">'+T.no_articles+'</div>';
-   else{
-    const byHost={};
-    items.forEach(it=>{(byHost[it.host]=byHost[it.host]||{api:it.api,t:[]}).t.push(it.title)});
-    Object.keys(byHost).forEach(hh=>prefetchThumbs(byHost[hh].api,hh,byHost[hh].t));
-    const nC=items.filter(it=>it.created).length,nE=items.length-nC;
-    const nDone=items.filter(it=>isReviewed(row.user,it.title)).length;
-    const nMine=items.filter(it=>isMine(row.user,it.title)).length;
-    const btn=(cls,f,cur,lbl)=>'<button class="btn-s '+cls+'" data-f="'+f+'" title="'+esc(T['tip_'+(cls==='art-filt-btn'?'af_':'rf_')+f]||'')+'" style="padding:3px 10px;font-size:12px'+(cur===f?';background:var(--grad-dark);color:#fff':'')+'">'+esc(lbl)+'</button>';
-    if(SCOPE==='all'){
-     h+='<div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">';
-     h+=btn('art-filt-btn','all',ART_FILTER,T.filter_all+' ('+items.length+')');
-     h+=btn('art-filt-btn','created',ART_FILTER,T.filter_created+' ('+nC+')');
-     h+=btn('art-filt-btn','expanded',ART_FILTER,T.filter_expanded+' ('+nE+')');
-     h+='</div>';
-    }
-    h+='<div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap">';
-    h+=btn('rev-filt-btn','all',REV_FILTER,T.filter_all);
-    h+=btn('rev-filt-btn','todo',REV_FILTER,T.filter_todo+' ('+(items.length-nDone)+')');
-    h+=btn('rev-filt-btn','done',REV_FILTER,T.filter_done+' ('+nDone+')');
-    if(!IS_JURY)h+=btn('rev-filt-btn','mine',REV_FILTER,T.filter_mine+' ('+nMine+')');
-    h+='</div>';
-    const filtered=items.filter(it=>{
-     if(ART_FILTER==='created'&&!it.created)return false;
-     if(ART_FILTER==='expanded'&&it.created)return false;
-     const rv=isReviewed(row.user,it.title);
-     if(REV_FILTER==='todo'&&rv)return false;
-     if(REV_FILTER==='done'&&!rv)return false;
-     if(REV_FILTER==='mine'&&!isMine(row.user,it.title))return false;
-     return true;
-    });
-    CUR_LIST=filtered.map(it=>({...it,user:row.user}));
-    if(!filtered.length)h+='<div class="hint">'+T.no_articles+'</div>';
-    else{
-     h+='<div class="carousel-wrap">';
-     h+='<button class="car-nav prev" onclick="this.nextElementSibling.scrollBy({left:-320,behavior:\\'smooth\\'})">‹</button>';
-     h+='<div class="carousel">';
-     filtered.forEach((it,k)=>{
-      const ad=slot(row.user,it.title);
-      const vals=Object.values(ad.scores||{}).filter(v=>v!=null);
-      const avg=vals.length?(vals.reduce((x,y)=>x+y,0)/vals.length):null;
-      const nCm=(ad.comments||[]).length;
-      const rv=isReviewed(row.user,it.title),mine=isMine(row.user,it.title);
-      const ex=EXTRACT_CACHE[it.host+'::'+it.title];
-      const thumbHtml=ex&&ex.thumb?'<img class="thumb" src="'+esc(ex.thumb)+'" alt="">':'<div class="thumb-ph">'+(ex?'—':'…')+'</div>';
-      h+='<div class="art-card" title="'+esc(T.tip_card)+'" style="'+(rv?'opacity:.72':'')+'" onclick="openIdx('+k+')">';
-      h+=thumbHtml;
-      h+='<div class="body"><div class="art-title">'+esc(it.title)+'</div>';
-      h+='<div class="hint" style="font-size:10px;margin-top:4px">'+esc(it.label)+' · +'+fmtN(it.bytes)+(LANG==='uk'?' Б':' B')+'</div>';
-      h+='<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:5px">';
-      h+='<span class="chip" style="font-size:10px;background:'+(it.created?'#e6f4ea':'var(--acc-soft)')+';color:'+(it.created?'#1d7a4f':'var(--acc)')+'">'+(it.created?T.created:T.expanded)+'</span>';
-      h+='<span class="chip '+(rv?'st-ok':'st-todo')+'" style="font-size:10px">'+(rv?'✓ '+T.reviewed:'● '+T.unreviewed)+'</span>';
-      if(mine)h+='<span class="chip tag-a" style="font-size:10px">'+T.mine+'</span>';
-      if(avg!=null)h+='<span class="chip" style="font-size:10px;background:#fbf3e2;color:#b07a1e">★ '+avg.toFixed(1)+'</span>';
-      if(nCm)h+='<span class="hint" style="font-size:10px">💬'+nCm+'</span>';
-      h+='</div></div></div>';
-     });
-     h+='</div>';
-     h+='<button class="car-nav next" onclick="this.previousElementSibling.scrollBy({left:320,behavior:\\'smooth\\'})">›</button>';
-     h+='</div>';
-    } // end if filtered.length
-   } // end else items.length
-   h+='</div></td></tr>';
-  }
- });
- h+='</tbody></table>';
- if(hiddenN)h+='<div class="hint" style="padding:8px 12px">'+T.hidden_min+' ('+fmtN(MIN_BYTES)+(LANG==='uk'?' Б':' B')+'): '+hiddenN+'</div>';
- el.innerHTML=h;
- const nc=el.querySelector('.carousel');if(nc&&keepScroll)nc.scrollLeft=keepScroll;
- el.querySelectorAll('.art-filt-btn').forEach(b=>{b.onclick=function(){setArtFilter(this.dataset.f)}});
- el.querySelectorAll('.rev-filt-btn').forEach(b=>{b.onclick=function(){setRevFilter(this.dataset.f)}});
- document.getElementById('csvlink').href='/export/'+CID+'.csv?quant='+(QUANT?1:0)+'&qual='+(QUAL?1:0);
- renderLoad();
- renderModal();
-}
-window.addEventListener('DOMContentLoaded',()=>{render();if(AUTORUN&&!IS_JURY&&CONTEST)runCheck()});
-</script>
-{% endif %}
-</body></html>"""
-
-ADMIN_TPL = """
-<div class="mode" style="margin-bottom:14px">
- <button class="on" onclick="document.getElementById('sec-c').style.display='block';document.getElementById('sec-u').style.display='none';document.getElementById('sec-p').style.display='none';[...this.parentNode.children].forEach(b=>b.className='');this.className='on'" title="{{t.tip_tab_c}}">{{t.tab_c}}</button>
- <button onclick="document.getElementById('sec-c').style.display='none';document.getElementById('sec-u').style.display='block';document.getElementById('sec-p').style.display='none';[...this.parentNode.children].forEach(b=>b.className='');this.className='on'" title="{{t.tip_tab_u}}">{{t.tab_u}}</button>
- <button onclick="document.getElementById('sec-c').style.display='none';document.getElementById('sec-u').style.display='none';document.getElementById('sec-p').style.display='block';[...this.parentNode.children].forEach(b=>b.className='');this.className='on'" title="{{t.tip_tab_p}}">{{t.tab_p}}</button>
-</div>
-
-<div id="sec-c" style="display:grid;gap:16px;grid-template-columns:minmax(320px,1fr) minmax(280px,360px)">
- <div class="card">
-  <h3 style="margin-top:0">{{t.edit_c if edit_contest else t.new_c}}</h3>
-  <form method="post" action="{{url_for('contest_save')}}">
-   <input type="hidden" name="id" value="{{edit_contest.id if edit_contest else ''}}">
-   <label class="lbl" title="{{t.tip_c_name}}">{{t.c_name}}</label>
-   <input name="name" value="{{edit_contest.name if edit_contest else ''}}" placeholder="Cultural Heritage 2026" required>
-   <label class="lbl" title="{{t.tip_projects}}">{{t.projects}}</label>
-   <textarea name="projects" rows="3" class="mono" style="font-size:12px">{{'\n'.join(edit_contest.projects) if edit_contest else 'https://uk.wikivoyage.org/wiki/Головна_сторінка\nhttps://uk.wikiquote.org/wiki/Головна_сторінка'}}</textarea>
-   <div class="hint">{{t.projects_h}}</div>
-   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-    <div><label class="lbl" title="{{t.tip_dstart}}">{{t.d_start}}</label><input type="date" id="start" name="start" value="{{edit_contest.start if edit_contest else ''}}"></div>
-    <div><label class="lbl" title="{{t.tip_dend}}">{{t.d_end}}</label><input type="date" id="end" name="end" value="{{edit_contest.end if edit_contest else ''}}"></div>
-   </div>
-   <div style="margin-top:12px;background:var(--acc-soft);border-radius:10px;padding:10px 12px">
-    <label class="lbl" style="margin-top:0" title="{{t.tip_tpl}}">{{t.tpl}}</label>
-    <input id="tpl" name="template" class="mono" style="font-size:12px"
-     value="{{edit_contest.template if edit_contest else ''}}"
-     placeholder="https://uk.wikivoyage.org/wiki/Шаблон:Cultural_Heritage_and_Notable_Personalities_2026">
-    <label class="hint" title="{{t.tip_talk}}" style="display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer">
-     <input type="checkbox" id="tplTalkOnly" name="tpl_talk_only" style="width:auto"
-      {{'checked' if edit_contest and edit_contest.tpl_talk_only else ''}}> {{t.tpl_talk_only}}
-    </label>
-    <div style="margin-top:8px;display:flex;gap:10px;align-items:center">
-     <button type="button" id="extbtn" class="btn-p" title="{{t.tip_tpl_btn}}" onclick="extractParticipants()">{{t.tpl_btn}}</button>
-     <label class="hint" title="{{t.tip_replace}}" style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="tplReplace" checked style="width:auto"> {{t.tpl_replace}}</label>
-     <span id="extmsg" class="hint mono"></span>
-    </div>
-    <div id="extbar" style="margin-top:6px"></div>
-    <div class="hint" style="margin-top:6px">{{t.tpl_h}}</div>
-   </div>
-   <label class="lbl" title="{{t.tip_parts}}">{{t.parts}}</label>
-   <textarea id="parts" name="participants" rows="6">{{'\n'.join(edit_contest.participants) if edit_contest else ''}}</textarea>
-   <label class="lbl" title="{{t.tip_scope}}">{{t.review_scope}}</label>
-   <select name="review_scope">
-    {% for k in ['all','created','expanded'] %}<option value="{{k}}" {{'selected' if (edit_contest.review_scope if edit_contest else 'all')==k else ''}}>{{t['scope_'~k]}}</option>{% endfor %}
-   </select>
-   <div class="hint">{{t.scope_h}}</div>
-   <label class="lbl" title="{{t.tip_cjury}}">{{t.contest_jury}}</label>
-   <div style="display:flex;flex-wrap:wrap;gap:6px 14px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#fff">
-    {% for u in users if u.role=='jury' %}
-    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px" title="{{t.tip_cjury}}"><input type="checkbox" name="jury" value="{{u.login}}" style="width:auto" {{'checked' if edit_contest and u.login in (edit_contest.jury or []) else ''}}> {{u.name}} <span class="mono hint">({{u.login}})</span></label>
-    {% else %}<span class="hint">{{t.no_jury_accounts}}</span>{% endfor %}
-   </div>
-   <div class="hint">{{t.contest_jury_h}}</div>
-   <label class="lbl" title="{{t.tip_formula}}">{{t.formula}}</label>
-   <input name="formula" class="mono" title="{{t.tip_formula}}" placeholder="bytes / 1000 + quality * 10" value="{{(edit_contest.formula or '') if edit_contest else ''}}">
-   <div class="hint">{{t.formula_h}}</div>
-   {% if msg %}<div style="color:var(--ok);font-weight:600;margin-top:8px">{{msg}}</div>{% endif %}
-   {% if edit_contest %}<div class="hint" style="margin-top:10px">{{t.upd_h}}</div>{% endif %}
-   <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
-    <button class="btn-p" title="{{t.tip_save}}">{{t.save if edit_contest else t.create}}</button>
-    {% if edit_contest %}<button class="btn-p" name="after" value="check" title="{{t.tip_save_update}}">{{t.save_update}}</button>{% endif %}
-    {% if edit_contest %}<a href="?view=admin" class="btn-s" style="text-decoration:none;padding:8px 14px">{{t.cancel}}</a>{% endif %}
-   </div>
-  </form>
+   if(QUANT&&!IS_JURY){
+@@ -1296,6 +1444,8 @@ function render(){
+   }
+   if(QUAL&&!IS_JURY){
+    h+='<td class="mono">'+(row.n?row.quality.toFixed(2):'—')+'<div class="hint">'+row.n+' '+T.scores_n+'</div></td>';
++   h+='<td class="mono">'+(row.kq.qc!=null?row.kq.qc.toFixed(2):'—')+'<div class="hint">'+row.kq.qcn+' '+T.th_created_n.toLowerCase()+'</div></td>';
++   h+='<td class="mono">'+(row.kq.qe!=null?row.kq.qe.toFixed(2):'—')+'<div class="hint">'+row.kq.qen+' '+T.th_expanded_n.toLowerCase()+'</div></td>';
+    if(HAS_F)h+='<td><span class="mono" style="font-weight:700;color:var(--gold);font-size:15px">'+(row.score!=null?row.score.toFixed(2):'—')+'</span></td>';
+    h+='<td class="mono" style="font-size:12px">'+(row.total?row.done+' / '+row.total:'—')
+     +(row.mine&&!IS_JURY?'<div class="hint">'+T.my_assigned+': '+row.mineDone+' / '+row.mine+'</div>':'')+'</td>';
+@@ -1387,12 +1537,19 @@ function render(){
+   }
+  });
+  h+='</tbody></table>';
+- if(hiddenN)h+='<div class="hint" style="padding:8px 12px">'+T.hidden_min+' ('+fmtN(MIN_BYTES)+(LANG==='uk'?' Б':' B')+'): '+hiddenN+'</div>';
++ if(hiddenN&&MIN_BYTES>0)h+='<div class="hint" style="padding:8px 12px">'+T.hidden_min+' ('+fmtN(MIN_BYTES)+BU+'): '+hiddenN+'</div>';
++ if(MIN_EXP>0||MIN_NEW>0){
++  let hiddenE=0;
++  rows.forEach(rw=>{if(rw.r)Object.values(rw.r.perProject||{}).forEach(pp=>(pp.list||[]).forEach(it=>{if((it.bytes||0)<(it.created?MIN_NEW:MIN_EXP))hiddenE++}))});
++  h+='<div class="hint" style="padding:8px 12px">'+T.hidden_exp+' ('+fmtN(MIN_NEW)+' / '+fmtN(MIN_EXP)+BU+'): '+hiddenE+'</div>';
++ }
+  el.innerHTML=h;
++ const tb=document.getElementById('topbox');
++ if(tb){if(QUAL&&!IS_JURY){tb.style.display='block';tb.innerHTML=topHtml(rows)}else{tb.style.display='none';tb.innerHTML=''}}
+  const nc=el.querySelector('.carousel');if(nc&&keepScroll)nc.scrollLeft=keepScroll;
+  el.querySelectorAll('.art-filt-btn').forEach(b=>{b.onclick=function(){setArtFilter(this.dataset.f)}});
+  el.querySelectorAll('.rev-filt-btn').forEach(b=>{b.onclick=function(){setRevFilter(this.dataset.f)}});
+- document.getElementById('csvlink').href='/export/'+CID+'.csv?quant='+(QUANT?1:0)+'&qual='+(QUAL?1:0);
++ document.getElementById('csvlink').href='/export/'+CID+'.csv?quant='+(QUANT?1:0)+'&qual='+(QUAL?1:0)+(SORT_KEY?'&sort='+SORT_KEY:'');
+  renderLoad();
+  renderModal();
+ }
+@@ -1446,6 +1603,42 @@ ADMIN_TPL = """
+     {% for k in ['all','created','expanded'] %}<option value="{{k}}" {{'selected' if (edit_contest.review_scope if edit_contest else 'all')==k else ''}}>{{t['scope_'~k]}}</option>{% endfor %}
+    </select>
+    <div class="hint">{{t.scope_h}}</div>
++   <label class="lbl" title="{{t.tip_min_bytes}}">{{t.min_bytes}}</label>
++   <input type="number" name="min_bytes" min="0" step="1" style="max-width:160px" title="{{t.tip_min_bytes}}" value="{{(edit_contest.min_bytes or 0) if edit_contest else 0}}">
++   <div class="hint">{{t.min_bytes_h}}</div>
++   <label class="lbl" title="{{t.tip_min_expand}}">{{t.min_expand}}</label>
++   <input type="number" name="min_expand" min="0" step="1" style="max-width:160px" title="{{t.tip_min_expand}}" value="{{(edit_contest.min_expand or 0) if edit_contest else 0}}">
++   <div class="hint">{{t.min_expand_h}}</div>
++   <label class="lbl" title="{{t.tip_min_created}}">{{t.min_created}}</label>
++   <input type="number" name="min_created" min="0" step="1" style="max-width:160px" title="{{t.tip_min_created}}" value="{{(edit_contest.min_created or 0) if edit_contest else 0}}">
++   <div class="hint">{{t.min_created_h}}</div>
++   {% if edit_contest %}
++   <div id="minExpWarn" class="hint" style="display:none;margin-top:6px;padding:8px 10px;border-radius:8px"></div>
++   <script>
++   (function(){
++    var CID_E={{edit_contest.id|tojson}},MSG={warn:{{t.me_warn|tojson}},ok:{{t.me_ok|tojson}},confirm:{{t.me_confirm|tojson}},more:{{t.me_more|tojson}}};
++    var inpB=document.querySelector('input[name=min_bytes]'),inp=document.querySelector('input[name=min_expand]'),inpN=document.querySelector('input[name=min_created]'),box=document.getElementById('minExpWarn'),sel=document.querySelector('select[name=review_scope]');
++    var form=inp.form,cnt=0,tm=null,seq=0;
++    function esc(x){return String(x).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
++    function check(){
++     var my=++seq,v=inp.value||'0';
++     fetch('/api/min_expand_preview/'+encodeURIComponent(CID_E)+'?value='+encodeURIComponent(v)+'&value_new='+encodeURIComponent(inpN.value||'0')+'&value_bytes='+encodeURIComponent(inpB.value||'0')+'&scope='+encodeURIComponent(sel?sel.value:'')).then(function(r){return r.json()}).then(function(d){
++      if(my!==seq||d.error)return;
++      cnt=d.count;box.style.display='block';
++      if(!d.count){box.style.background='#e6f4ea';box.textContent=MSG.ok;return}
++      box.style.background='#fdecea';
++      var h='<b>'+esc(MSG.warn.replace('{n}',d.count))+'</b><ul style="margin:6px 0 0 18px;padding:0">';
++      d.items.forEach(function(x){h+='<li>'+esc(x.participant)+' — '+esc(x.article)+' (+'+x.bytes+', '+x.scores+')</li>'});
++      if(d.count>d.items.length)h+='<li>'+esc(MSG.more)+' '+(d.count-d.items.length)+'</li>';
++      box.innerHTML=h+'</ul>';
++     });
++    }
++    function later(){clearTimeout(tm);tm=setTimeout(check,300)}
++    inp.addEventListener('input',later);inpN.addEventListener('input',later);inpB.addEventListener('input',later);if(sel)sel.addEventListener('change',later);
++    form.addEventListener('submit',function(e){if(cnt>0&&!confirm(MSG.confirm.replace('{n}',cnt)))e.preventDefault()});
++   })();
++   </script>
++   {% endif %}
+    <label class="lbl" title="{{t.tip_cjury}}">{{t.contest_jury}}</label>
+    <div style="display:flex;flex-wrap:wrap;gap:6px 14px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#fff">
+     {% for u in users if u.role=='jury' %}
+@@ -1575,7 +1768,8 @@ ANALYSIS_TPL = """
+  <div id="loadtbl" style="margin-top:8px"></div>
  </div>
- <div class="card">
-  <h3 style="margin-top:0">{{t.tab_c}} ({{contests|length}})</h3>
-  {% if not contests %}<div class="hint">{{t.no_c}}</div>{% endif %}
-  {% for c in contests %}
-  <div style="border-bottom:1px solid var(--line);padding:10px 0">
-   <div style="font-weight:700">{{c.name}}</div>
-   <div class="hint">{{c.hosts}} · {{t.parts_n}}: {{c.participants|length}} · {{t.jury}}: {{c.jury|length}}</div>
-   <div class="mono hint">{{c.formula}}</div>
-   <div style="display:flex;gap:6px;margin-top:4px">
-    <a class="btn-s" style="padding:4px 10px;font-size:12px;text-decoration:none" title="{{t.tip_edit}}" href="?view=admin&edit={{c.id}}">{{t.edit}}</a>
-    <form method="post" action="{{url_for('contest_delete')}}" style="margin:0">
-     <input type="hidden" name="id" value="{{c.id}}">
-     <button class="btn-d" title="{{t.tip_delete}}" style="padding:4px 10px;font-size:12px">{{t.delete}}</button></form>
-   </div>
-  </div>
-  {% endfor %}
- </div>
-</div>
-
-<div id="sec-u" style="display:none">
- <div style="display:grid;gap:16px;grid-template-columns:minmax(300px,420px) 1fr">
-  <div class="card"><h3 style="margin-top:0">{{t.add_u}}</h3>
-   <form method="post" action="{{url_for('user_save')}}">
-    <label class="lbl" title="{{t.tip_role}}">{{t.role}}</label>
-    <select name="role"><option value="jury">{{t.jury}}</option><option value="admin">{{t.admin}}</option></select>
-    <label class="lbl" title="{{t.tip_uname}}">{{t.u_name}}</label><input name="name">
-    <label class="lbl" title="{{t.tip_ulogin}}">{{t.login}}</label><input name="login" required>
-    <label class="lbl" title="{{t.tip_upass}}">{{t.password}}</label><input name="password" type="password" required>
-    <button class="btn-p" title="{{t.tip_create_u}}" style="margin-top:12px">{{t.create}}</button>
-   </form></div>
-  <div class="card"><h3 style="margin-top:0">{{t.accounts}} ({{users|length}})</h3>
-   {% for u in users %}
-   <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)">
-    <span class="chip {{'tag-a' if u.role=='admin' else 'tag-j'}}">{{t[u.role]}}</span>
-    <b>{{u.name}}</b><span class="mono hint">{{u.login}}</span>
-    {% if u.login!=me.login %}
-    <form method="post" action="{{url_for('user_delete')}}" style="margin-left:auto">
-     <input type="hidden" name="login" value="{{u.login}}">
-     <button class="btn-d" title="{{t.tip_del_user}}" style="padding:3px 10px;font-size:12px">{{t.delete}}</button></form>
-    {% else %}<span class="hint" style="margin-left:auto">{{t.its_you}}</span>{% endif %}
-   </div>{% endfor %}</div>
- </div>
-</div>
-
-<div id="sec-p" style="display:none">
- <div class="card" style="max-width:400px"><h3 style="margin-top:0">{{t.ch_pass}} — {{me.name}}</h3>
-  <form method="post" action="{{url_for('change_password')}}">
-   <label class="lbl">{{t.new_pass}}</label><input name="p1" type="password" required minlength="4">
-   <label class="lbl">{{t.again}}</label><input name="p2" type="password" required minlength="4">
-   <button class="btn-p" style="margin-top:12px">{{t.save}}</button>
-  </form></div>
-</div>
-"""
-
-ANALYSIS_TPL = """
-{% if not contest %}
- <div class="card hint">{{t.no_c}}</div>
-{% else %}
-<div class="card" style="display:flex;flex-wrap:wrap;gap:14px;align-items:center">
- {% if me.role=='admin' %}
- <div>
-  <div class="lbl" style="margin:0">{{t.mode}}</div>
-  <div class="mode" style="margin-top:4px">
-   <button id="mq" class="on" title="{{t.tip_quant}}" onclick="setMode('quant')">{{t.quant}}</button>
-   <button id="ml" title="{{t.tip_qual}}" onclick="setMode('qual')">{{t.qual}}</button>
-  </div>
-  <div id="modehint" class="hint" style="margin-top:4px">{{t.modes_h}}</div>
- </div>
+ <div class="card" style="padding:0;overflow-x:auto"><div id="tbl"></div></div>
+-<div class="hint">{% if me.role=='admin' %}{{t.f_of}} <span class="chip">{{contest.formula if contest.formula else '—'}}</span> · {% endif %}{{t.scope_label}} <span class="chip">{{t['scope_'~(contest.review_scope or 'all')]}}</span></div>
++<div id="topbox" class="card" style="display:none"></div>
++<div class="hint">{% if me.role=='admin' %}{{t.f_of}} <span class="chip">{{contest.formula if contest.formula else '—'}}</span> · {% endif %}{{t.scope_label}} <span class="chip">{{t['scope_'~(contest.review_scope or 'all')]}}</span>{% if contest.min_bytes %} · {{t.min_bytes_chip}} <span class="chip">{{contest.min_bytes}} {{t.bytes_unit}}</span>{% endif %}{% if contest.min_created %} · {{t.min_created_chip}} <span class="chip">{{contest.min_created}} {{t.bytes_unit}}</span>{% endif %}{% if contest.min_expand %} · {{t.min_expand_chip}} <span class="chip">{{contest.min_expand}} {{t.bytes_unit}}</span>{% endif %}</div>
  {% endif %}
- <div style="margin-left:auto;text-align:right;min-width:280px">
-  <div style="display:flex;gap:8px;justify-content:flex-end">
-   <a id="csvlink" title="{{t.tip_export}}" class="btn-s" style="text-decoration:none;padding:8px 14px" href="/export/{{cid}}.csv?quant=1&qual=0">{{t.export}}</a>
-   {% if me.role=='admin' %}
-   <button id="runbtn" class="btn-p" title="{{t.tip_check}}" onclick="runCheck()">{{t.check}}</button>
-   {% else %}
-   <span class="hint" style="align-self:center;font-size:11px;max-width:200px;text-align:right">{{t.jury_no_check}}</span>
-   {% endif %}
-  </div>
-  <div id="runbar" style="margin-top:6px"></div>
- </div>
-</div>
-<div id="loadbox" class="card" style="display:none">
- <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end">
-  <div><div class="lbl" style="margin:0">{{t.load_title if me.role=='admin' else t.my_progress_title}}</div>
-   {% if me.role=='admin' %}<div class="hint">{{t.distribute_h}}</div>{% endif %}</div>
-  {% if me.role=='admin' %}
-  <div style="margin-left:auto;display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
-   <div><label class="lbl" style="margin:0 0 2px">{{t.per_article}}</label><input id="distPer" title="{{t.tip_per_article}}" type="number" min="1" value="1" style="width:70px"></div>
-   <label class="hint" title="{{t.tip_reset}}" style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><input type="checkbox" id="distReset" style="width:auto"> {{t.reset_dist}}</label>
-   <button class="btn-p" title="{{t.tip_distribute}}" onclick="runDistribute()">{{t.distribute}}</button>
-  </div>
-  {% endif %}
- </div>
- {% if me.role=='admin' %}
- <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
-  <div class="lbl" style="margin:0" title="{{t.tip_reassign}}">{{t.reassign_title}}</div>
-  <div class="hint">{{t.reassign_h}}</div>
-  <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-top:6px">
-   <div><label class="lbl" style="margin:0 0 2px">{{t.reassign_from}}</label>
-    <select id="reFrom" title="{{t.tip_reassign}}"><option value=""></option>{% for u in users if u.role=='jury' %}<option value="{{u.login}}">{{u.name}} ({{u.login}})</option>{% endfor %}</select></div>
-   <div><label class="lbl" style="margin:0 0 2px">{{t.reassign_to}}</label>
-    <select id="reTo" title="{{t.tip_reassign}}"><option value=""></option>{% for u in users if u.role=='jury' and u.login in (contest.jury or []) %}<option value="{{u.login}}">{{u.name}} ({{u.login}})</option>{% endfor %}</select></div>
-   <button class="btn-p" title="{{t.tip_reassign}}" onclick="runReassign()">{{t.reassign_btn}}</button>
-  </div>
- </div>
- {% endif %}
- <div id="distmsg" class="hint mono" style="margin-top:6px"></div>
- <div id="loadtbl" style="margin-top:8px"></div>
-</div>
-<div class="card" style="padding:0;overflow-x:auto"><div id="tbl"></div></div>
-<div class="hint">{% if me.role=='admin' %}{{t.f_of}} <span class="chip">{{contest.formula if contest.formula else '—'}}</span> · {% endif %}{{t.scope_label}} <span class="chip">{{t['scope_'~(contest.review_scope or 'all')]}}</span></div>
-{% endif %}
-{% if me.role=='jury' %}
-<div class="card" style="max-width:400px;margin-top:14px">
- <h3 style="margin-top:0">{{t.my_pass_title}} — {{me.name}}</h3>
- <form method="post" action="{{url_for('change_password')}}">
-  <label class="lbl">{{t.new_pass}}</label><input name="p1" type="password" required minlength="4">
-  <label class="lbl">{{t.again}}</label><input name="p2" type="password" required minlength="4">
-  <button class="btn-p" style="margin-top:12px">{{t.save}}</button>
- </form>
-</div>
-{% endif %}
-"""
-
-# ── Допоміжне ────────────────────────────────────────────────
-def get_contests():
-    rows = db().execute("SELECT * FROM contests").fetchall()
-    cj = {}
-    for r in db().execute("SELECT contest_id, login FROM contest_jury ORDER BY login"):
-        cj.setdefault(r["contest_id"], []).append(r["login"])
-    out = []
-    for r in rows:
-        c = dict(r)
-        c["projects"] = json.loads(c["projects"] or "[]")
-        c["participants"] = json.loads(c["participants"] or "[]")
-        hosts = []
-        for p in c["projects"]:
-            m = re.match(r"https?://([^/]+)", p)
-            if m:
-                hosts.append(m.group(1).replace(".org", ""))
-        c["hosts"] = " · ".join(hosts)
-        c["jury"] = cj.get(c["id"], [])
-        out.append(c)
-    return out
-
-def get_assess(cid, only=None):
-    """Оцінки, коментарі, статуси перевірки та призначення по кожній статті.
-    Структура: {учасник: {стаття: {"scores":{журі:бал}, "comments":[...],
-                                   "reviewed":[журі], "assigned":[журі]}}}"""
-    assess = {}
-
-    def slot(p, a):
-        return assess.setdefault(p, {}).setdefault(
-            a, {"scores": {}, "comments": [], "reviewed": [], "assigned": []})
-
-    for r in db().execute("SELECT * FROM article_scores WHERE contest_id=?", (cid,)):
-        slot(r["participant"], r["article"])["scores"][r["jury"]] = r["value"]
-    for r in db().execute(
-            "SELECT * FROM article_comments WHERE contest_id=? ORDER BY id", (cid,)):
-        slot(r["participant"], r["article"])["comments"].append(
-            {"jury": r["jury_name"], "text": r["text"], "date": r["date"]})
-    for r in db().execute("SELECT * FROM article_reviews WHERE contest_id=?", (cid,)):
-        if only is None or r["jury"] == only:
-            slot(r["participant"], r["article"])["reviewed"].append(r["jury"])
-    for r in db().execute(
-            "SELECT * FROM article_assignments WHERE contest_id=? ORDER BY jury", (cid,)):
-        if only is None or r["jury"] == only:
-            slot(r["participant"], r["article"])["assigned"].append(r["jury"])
-    return assess
-
-def split_stats(r):
-    """Нові та доповнені статті учасника: кількість і додані байти."""
-    s = {"created": 0, "expanded": 0, "bc": 0, "be": 0}
-    for pp in ((r or {}).get("perProject") or {}).values():
-        for it in (pp.get("list") or []):
-            if it.get("created"):
-                s["created"] += 1
-                s["bc"] += it.get("bytes", 0)
-            else:
-                s["expanded"] += 1
-                s["be"] += it.get("bytes", 0)
-    return s
-
-def get_legacy(cid):
-    """Оцінки та коментарі, виставлені в попередній версії (на рівні учасника, а не статті).
-    Структура: {учасник: {"scores": {журі: бал}, "comments": [...]}}"""
-    out = {}
-
-    def slot(p):
-        return out.setdefault(p, {"scores": {}, "comments": []})
-
-    for r in db().execute("SELECT participant, jury, value FROM scores WHERE contest_id=?", (cid,)):
-        if r["value"] is not None:
-            slot(r["participant"])["scores"][r["jury"]] = r["value"]
-    for r in db().execute("SELECT participant, jury_name, text, date FROM comments "
-                          "WHERE contest_id=? ORDER BY id", (cid,)):
-        slot(r["participant"])["comments"].append(
-            {"jury": r["jury_name"], "text": r["text"], "date": r["date"]})
-    return out
-
-def in_scope(it, scope):
-    """Чи входить стаття (запис зі списку внеску) до обраного адміном обсягу перевірки."""
-    return scope == "all" or (scope == "created") == bool(it.get("created"))
-
-def scope_titles(r, scope):
-    """Назви статей учасника в обсязі перевірки (None = без обмежень)."""
-    if scope == "all" or not r:
-        return None
-    return {it.get("title") for pp in (r.get("perProject") or {}).values()
-            for it in (pp.get("list") or []) if in_scope(it, scope)}
-
-def article_quality(participant_assess, legacy=None, allowed=None):
-    """Якість учасника = середнє арифметичне середніх оцінок по кожній статті
-    (спершу усереднюємо оцінки журі в межах статті, потім — по статтях).
-    Якщо оцінок по статтях немає, але є оцінки з попередньої версії — беремо їх середнє."""
-    article_avgs = []
-    n = 0
-    for art, a in (participant_assess or {}).items():
-        if allowed is not None and art not in allowed:
-            continue
-        vals = [v for v in (a.get("scores") or {}).values() if v is not None]
-        if vals:
-            article_avgs.append(sum(vals) / len(vals))
-            n += len(vals)
-    if article_avgs:
-        return sum(article_avgs) / len(article_avgs), n
-    old = [v for v in ((legacy or {}).get("scores") or {}).values() if v is not None]
-    if old:
-        return sum(old) / len(old), len(old)
-    return 0.0, 0
-
-class D(dict):
-    __getattr__ = dict.get
-
-def contest_access(cid):
-    """Адмін бачить усі конкурси; журі — лише ті, до яких його додано."""
-    u = session.get("user")
-    if not u:
-        return False
-    if u["role"] == "admin":
-        return True
-    return db().execute("SELECT 1 FROM contest_jury WHERE contest_id=? AND login=?",
-                        (cid, u["login"])).fetchone() is not None
-
-# ── Маршрути ─────────────────────────────────────────────────
-@app.route("/login", methods=["GET", "POST"])
-def login_view():
-    l = lang()
-    err = False
-    if request.method == "POST":
-        row = db().execute("SELECT * FROM users WHERE login=?",
-                           (request.form.get("login", "").strip(),)).fetchone()
-        if row and check_password_hash(row["pass"], request.form.get("password", "")):
-            session["user"] = {"login": row["login"], "name": row["name"], "role": row["role"]}
-            return redirect(url_for("index"))
-        err = True
-    return render_template_string(LOGIN_HTML, t=D(T[l]), l=l, err=err, oauth_enabled=OAUTH_ENABLED)
-
-@app.route("/login/oauth")
-def login_oauth():
-    if not OAUTH_ENABLED:
-        return redirect(url_for("login_view"))
-    consumer_token = mwoauth.ConsumerToken(OAUTH_CONSUMER_KEY, OAUTH_CONSUMER_SECRET)
-    try:
-        redirect_url, request_token = mwoauth.initiate(OAUTH_MWURI, consumer_token)
-    except Exception:
-        app.logger.exception("mwoauth.initiate failed")
-        return redirect(url_for("login_view"))
-    session["oauth_request_token"] = dict(zip(request_token._fields, request_token))
-    return redirect(redirect_url)
-
-@app.route("/oauth-callback")
-def oauth_callback():
-    l = lang()
-    if not OAUTH_ENABLED or "oauth_request_token" not in session:
-        return redirect(url_for("login_view"))
-    consumer_token = mwoauth.ConsumerToken(OAUTH_CONSUMER_KEY, OAUTH_CONSUMER_SECRET)
-    request_token = mwoauth.RequestToken(**session.pop("oauth_request_token"))
-    try:
-        access_token = mwoauth.complete(
-            OAUTH_MWURI, consumer_token, request_token, request.query_string)
-        identity = mwoauth.identify(OAUTH_MWURI, consumer_token, access_token)
-    except Exception:
-        app.logger.exception("OAuth authentication failed")
-        return render_template_string(LOGIN_HTML, t=D(T[l]), l=l, err=True, oauth_enabled=OAUTH_ENABLED)
-    username = identity.get("username", "")
-    row = db().execute("SELECT * FROM users WHERE login=?", (username,)).fetchone()
-    if not row:
-        return render_template_string(LOGIN_HTML, t=D(T[l]), l=l, oauth_enabled=OAUTH_ENABLED,
-                                       oauth_unknown=username)
-    session["user"] = {"login": row["login"], "name": row["name"], "role": row["role"]}
-    return redirect(url_for("index"))
-
-@app.route("/logout")
-def logout():
-    session.pop("user", None)
-    return redirect(url_for("login_view"))
-
-@app.route("/")
-@login_required
-def index():
-    l = lang()
-    me = D(session["user"])
-    contests = [D(c) for c in get_contests()]
-    if me.role != "admin":
-        contests = [c for c in contests if me.login in (c.jury or [])]
-    cid = request.args.get("contest") or (contests[0].id if contests else None)
-    contest = next((c for c in contests if c.id == cid), None)
-    view = request.args.get("view", "analysis")
-    if view == "admin" and me.role != "admin":
-        view = "analysis"
-    edit_contest = None
-    if view == "admin" and request.args.get("edit"):
-        edit_contest = next((c for c in contests if c.id == request.args["edit"]), None)
-    results = None
-    assess = {}
-    if contest:
-        rr = db().execute("SELECT data FROM results WHERE contest_id=?", (contest.id,)).fetchone()
-        results = json.loads(rr["data"]) if rr else None
-        assess = get_assess(contest.id, None if me.role == "admin" else me.login)
-    tpl = MAIN_HTML.replace("{% include 'ADMIN' %}", ADMIN_TPL)\
-                   .replace("{% include 'ANALYSIS' %}", ANALYSIS_TPL)
-    users = [D(dict(u)) for u in db().execute("SELECT * FROM users").fetchall()]
-    return render_template_string(
-        tpl, t=D(T[l]), l=l, me=me, contests=contests, cid=cid, contest=contest,
-        view=view, edit_contest=edit_contest, users=users,
-        msg=request.args.get("msg"),
-        autorun=(request.args.get("autorun") == "1" and me.role == "admin"),
-        tjson=json.dumps(T[l], ensure_ascii=False),
-        cjson=json.dumps({k: v for k, v in contest.items() if me.role == "admin" or k != "jury"},
-                         ensure_ascii=False) if contest else "null",
-        rjson=json.dumps(results, ensure_ascii=False) if results else "null",
-        ajson=json.dumps(assess, ensure_ascii=False), min_bytes=MIN_BYTES,
-        juryjson=json.dumps([{"login": u.login, "name": u.name, "role": u.role,
-                              "inc": u.login in ((contest.jury or []) if contest else [])} for u in users
-                             if me.role == "admin" or u.login == me.login],
-                            ensure_ascii=False).replace("</", "<\\/"),
-        ljson=json.dumps(get_legacy(contest.id) if contest else {},
-                         ensure_ascii=False).replace("</", "<\\/"))
-
-@app.route("/admin/contest/save", methods=["POST"])
-@admin_required
-def contest_save():
-    f = request.form
-    projects = [s.strip() for s in f.get("projects", "").splitlines() if s.strip()]
-    participants = [s.strip() for s in f.get("participants", "").splitlines() if s.strip()]
-    formula = f.get("formula", "").strip()
-    if formula and not validate_formula(formula):
-        formula = ""  # некоректну формулу не зберігаємо; порожня = формула не використовується
-    cid = f.get("id") or "c" + hex(int(time.time() * 1000))[2:]
-    scope = f.get("review_scope") if f.get("review_scope") in ("all", "created", "expanded") else "all"
-    db().execute("""INSERT INTO contests VALUES(?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(id) DO UPDATE SET name=excluded.name,template=excluded.template,
-        projects=excluded.projects,participants=excluded.participants,
-        formula=excluded.formula,start=excluded.start,end=excluded.end,
-        tpl_talk_only=excluded.tpl_talk_only,review_scope=excluded.review_scope""",
-        (cid, f.get("name", "").strip(), f.get("template", "").strip(),
-         json.dumps(projects), json.dumps(participants), formula,
-         f.get("start", ""), f.get("end", ""), 1 if f.get("tpl_talk_only") else 0, scope))
-    # журі конкурсу: оновлюємо лише склад; оцінки, перевірки та призначення не чіпаємо
-    valid = {r["login"] for r in db().execute("SELECT login FROM users WHERE role='jury'")}
-    chosen = [j for j in f.getlist("jury") if j in valid]
-    db().execute("DELETE FROM contest_jury WHERE contest_id=?", (cid,))
-    db().executemany("INSERT OR IGNORE INTO contest_jury VALUES(?,?)", [(cid, j) for j in chosen])
-    # з кешу внеску прибираємо учасників, яких більше немає у списку (оцінки не видаляємо)
-    rr = db().execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
-    if rr:
-        old = json.loads(rr["data"]) or {}
-        keep = set(participants)
-        kept = {k: v for k, v in old.items() if k in keep}
-        if len(kept) != len(old):
-            db().execute("UPDATE results SET data=? WHERE contest_id=?",
-                         (json.dumps(kept, ensure_ascii=False), cid))
-    db().commit()
-    if f.get("after") == "check":
-        return redirect(url_for("index", view="analysis", contest=cid, autorun=1))
-    return redirect(url_for("index", view="admin", contest=cid, msg=T[lang()]["saved"]))
-
-@app.route("/admin/contest/delete", methods=["POST"])
-@admin_required
-def contest_delete():
-    cid = request.form["id"]
-    for tbl in ("contests", "results", "scores", "comments", "article_scores",
-                "article_comments", "article_reviews", "article_assignments", "contest_jury"):
-        db().execute(f"DELETE FROM {tbl} WHERE {'id' if tbl=='contests' else 'contest_id'}=?", (cid,))
-    db().commit()
-    return redirect(url_for("index", view="admin"))
-
-@app.route("/admin/user/save", methods=["POST"])
-@admin_required
-def user_save():
-    f = request.form
-    login = f.get("login", "").strip()
-    if login and f.get("password"):
-        db().execute("INSERT OR IGNORE INTO users VALUES(?,?,?,?)",
-                     (login, f.get("name", "").strip() or login,
-                      generate_password_hash(f["password"]),
-                      "admin" if f.get("role") == "admin" else "jury"))
-        db().commit()
-    return redirect(url_for("index", view="admin"))
-
-@app.route("/admin/user/delete", methods=["POST"])
-@admin_required
-def user_delete():
-    if request.form["login"] != session["user"]["login"]:
-        db().execute("DELETE FROM users WHERE login=?", (request.form["login"],))
-        db().execute("DELETE FROM contest_jury WHERE login=?", (request.form["login"],))
-        db().commit()
-    return redirect(url_for("index", view="admin"))
-
-@app.route("/password", methods=["POST"])
-@login_required
-def change_password():
-    p1, p2 = request.form.get("p1", ""), request.form.get("p2", "")
-    if len(p1) >= 4 and p1 == p2:
-        db().execute("UPDATE users SET pass=? WHERE login=?",
-                     (generate_password_hash(p1), session["user"]["login"]))
-        db().commit()
-    return redirect(url_for("index", view="admin"))
-
-# ── API для фронтенду ────────────────────────────────────────
-@app.route("/api/contest/<cid>/participants", methods=["POST"])
-@login_required
-def api_set_participants(cid):
-    """Зберігає список учасників наявного конкурсу (без створення нового); оцінки не чіпає."""
-    if session["user"]["role"] != "admin":
-        return jsonify(error="forbidden"), 403
-    if not db().execute("SELECT 1 FROM contests WHERE id=?", (cid,)).fetchone():
-        return jsonify(error="not_found"), 404
-    names = (request.get_json() or {}).get("participants") or []
-    participants = list(dict.fromkeys(str(x).strip() for x in names if str(x).strip()))
-    db().execute("UPDATE contests SET participants=? WHERE id=?",
-                 (json.dumps(participants, ensure_ascii=False), cid))
-    rr = db().execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
-    if rr:
-        keep = set(participants)
-        old = json.loads(rr["data"]) or {}
-        db().execute("UPDATE results SET data=? WHERE contest_id=?",
-                     (json.dumps({k: v for k, v in old.items() if k in keep}, ensure_ascii=False), cid))
-    db().commit()
-    return jsonify(ok=True, count=len(participants))
-
-@app.route("/api/results/<cid>", methods=["POST"])
-@login_required
-def api_results(cid):
-    if session["user"]["role"] != "admin":
-        return jsonify(error="forbidden"), 403
-    db().execute("""INSERT INTO results VALUES(?,?,?)
-        ON CONFLICT(contest_id) DO UPDATE SET data=excluded.data,updated=excluded.updated""",
-        (cid, json.dumps(request.get_json(), ensure_ascii=False), int(time.time())))
-    db().commit()
-    return jsonify(ok=True)
-
-@app.route("/api/score", methods=["POST"])
-@login_required
-def api_score():
-    d = request.get_json()
-    if not contest_access(d["contest"]):
-        return jsonify(error="forbidden"), 403
-    article = d.get("article", "")
-    me = session["user"]["login"]
-    if d.get("value") is None:
-        db().execute("DELETE FROM article_scores WHERE contest_id=? AND participant=? AND article=? AND jury=?",
-                     (d["contest"], d["participant"], article, me))
-    else:
-        db().execute("""INSERT INTO article_scores VALUES(?,?,?,?,?)
-            ON CONFLICT(contest_id,participant,article,jury) DO UPDATE SET value=excluded.value""",
-            (d["contest"], d["participant"], article, me, float(d["value"])))
-        # виставлена оцінка автоматично означає, що статтю перевірено
-        db().execute("INSERT OR IGNORE INTO article_reviews VALUES(?,?,?,?)",
-                     (d["contest"], d["participant"], article, me))
-    db().commit()
-    return jsonify(ok=True)
-
-@app.route("/api/review", methods=["POST"])
-@login_required
-def api_review():
-    d = request.get_json()
-    if not contest_access(d["contest"]):
-        return jsonify(error="forbidden"), 403
-    key = (d["contest"], d["participant"], d.get("article", ""), session["user"]["login"])
-    if d.get("reviewed"):
-        db().execute("INSERT OR IGNORE INTO article_reviews VALUES(?,?,?,?)", key)
-    else:
-        db().execute("DELETE FROM article_reviews WHERE contest_id=? AND participant=? "
-                     "AND article=? AND jury=?", key)
-    db().commit()
-    return jsonify(ok=True)
-
-@app.route("/api/comment", methods=["POST"])
-@login_required
-def api_comment():
-    d = request.get_json()
-    if not contest_access(d["contest"]):
-        return jsonify(error="forbidden"), 403
-    db().execute("INSERT INTO article_comments(contest_id,participant,article,jury_name,text,date) VALUES(?,?,?,?,?,?)",
-                 (d["contest"], d["participant"], d.get("article", ""), session["user"]["name"],
-                  d["text"][:2000], time.strftime("%Y-%m-%d %H:%M")))
-    db().commit()
-    return jsonify(ok=True)
-
-@app.route("/api/distribute/<cid>", methods=["POST"])
-@login_required
-def api_distribute(cid):
-    """Рівномірно розподіляє статті конкурсу між журі (лише адмін).
-    Вже наявні призначення зберігаються; нові статті йдуть журі з найменшим навантаженням."""
-    if session["user"]["role"] != "admin":
-        return jsonify(error="forbidden"), 403
-    d = request.get_json(silent=True) or {}
-    con = db()
-    rr = con.execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
-    results = json.loads(rr["data"]) if rr else {}
-    items, seen = [], set()
-    legacy = get_legacy(cid)
-    srow = con.execute("SELECT review_scope FROM contests WHERE id=?", (cid,)).fetchone()
-    scope = (srow["review_scope"] if srow else None) or "all"
-    for user in sorted(results):
-        if user in legacy and (legacy[user]["scores"] or legacy[user]["comments"]):
-            continue  # внесок уже перевірено в попередній версії
-        if ((results[user] or {}).get("bytes") or 0) < MIN_BYTES:
-            continue  # внесок нижчий за мінімальний поріг
-        for pp in ((results[user] or {}).get("perProject") or {}).values():
-            for it in (pp.get("list") or []):
-                if not in_scope(it, scope):
-                    continue
-                k = (user, it.get("title", ""))
-                if k[1] and k not in seen:
-                    seen.add(k)
-                    items.append(k)
-    if not items:
-        return jsonify(error="no_results"), 400
-    pool = [r["login"] for r in con.execute(
-        "SELECT cj.login FROM contest_jury cj JOIN users u ON u.login=cj.login "
-        "WHERE cj.contest_id=? AND u.role='jury' ORDER BY cj.login", (cid,))]
-    if not pool:
-        return jsonify(error="no_jury"), 400
-    try:
-        per = max(1, min(int(d.get("per_article") or 1), len(pool)))
-    except (TypeError, ValueError):
-        per = 1
-    if d.get("reset"):
-        con.execute("DELETE FROM article_assignments WHERE contest_id=?", (cid,))
-    load = {j: 0 for j in pool}
-    have = {}
-    existing = con.execute("SELECT participant, article, jury FROM article_assignments "
-                           "WHERE contest_id=?", (cid,)).fetchall()
-    for r in existing:
-        k = (r["participant"], r["article"])
-        if k in seen and r["jury"] in load:
-            have.setdefault(k, set()).add(r["jury"])
-            load[r["jury"]] += 1
-        else:  # застаріле призначення: статті вже немає або журі видалено
-            con.execute("DELETE FROM article_assignments WHERE contest_id=? AND participant=? "
-                        "AND article=? AND jury=?", (cid, r["participant"], r["article"], r["jury"]))
-    rnd = random.Random(cid)
-    rnd.shuffle(items)
-    for k in items:
-        got = have.setdefault(k, set())
-        while len(got) < per:
-            cand = [j for j in pool if j not in got]
-            j = min(cand, key=lambda x: (load[x], rnd.random()))
-            con.execute("INSERT OR IGNORE INTO article_assignments VALUES(?,?,?,?)",
-                        (cid, k[0], k[1], j))
-            got.add(j)
-            load[j] += 1
-    con.commit()
-    return jsonify(ok=True, items=len(items), load=load)
-
-@app.route("/api/reassign/<cid>", methods=["POST"])
-@login_required
-def api_reassign(cid):
-    """Передає НЕПЕРЕВІРЕНІ статті одного журі іншому (лише адмін).
-    Перевірені статті, оцінки, коментарі та позначки не змінюються."""
-    if session["user"]["role"] != "admin":
-        return jsonify(error="forbidden"), 403
-    d = request.get_json(silent=True) or {}
-    src, dst = d.get("from"), d.get("to")
-    con = db()
-    if not src or not dst or src == dst:
-        return jsonify(error="bad_request"), 400
-    ok = {r["login"] for r in con.execute(
-        "SELECT cj.login FROM contest_jury cj JOIN users u ON u.login=cj.login "
-        "WHERE cj.contest_id=? AND u.role='jury'", (cid,))}
-    if dst not in ok:
-        return jsonify(error="bad_request"), 400
-    if not con.execute("SELECT 1 FROM users WHERE login=? AND role='jury'", (src,)).fetchone():
-        return jsonify(error="bad_request"), 400
-    nm = con.execute("SELECT name FROM users WHERE login=?", (src,)).fetchone()
-    src_name = (nm["name"] if nm else None) or src
-    # що вже зроблено джерелом: перевірки, оцінки, коментарі (статті) та оцінки/коментарі рівня учасника
-    done = set()
-    for r in con.execute("SELECT participant, article FROM article_reviews "
-                         "WHERE contest_id=? AND jury=?", (cid, src)):
-        done.add((r["participant"], r["article"]))
-    for r in con.execute("SELECT participant, article FROM article_scores "
-                         "WHERE contest_id=? AND jury=?", (cid, src)):
-        done.add((r["participant"], r["article"]))
-    for r in con.execute("SELECT participant, article FROM article_comments "
-                         "WHERE contest_id=? AND jury_name=?", (cid, src_name)):
-        done.add((r["participant"], r["article"]))
-    legacy_users = set()
-    for r in con.execute("SELECT participant FROM scores WHERE contest_id=? AND jury=? "
-                         "AND value IS NOT NULL", (cid, src)):
-        legacy_users.add(r["participant"])
-    for r in con.execute("SELECT participant FROM comments WHERE contest_id=? AND jury_name=?",
-                         (cid, src_name)):
-        legacy_users.add(r["participant"])
-    rows = con.execute("SELECT participant, article FROM article_assignments "
-                       "WHERE contest_id=? AND jury=?", (cid, src)).fetchall()
-    movable, kept = [], 0
-    for r in rows:
-        k = (r["participant"], r["article"])
-        if k in done or r["participant"] in legacy_users:
-            kept += 1
-        else:
-            movable.append(k)
-    if d.get("dry"):
-        return jsonify(ok=True, movable=len(movable), kept=kept)
-    moved = merged = 0
-    for p, a in movable:
-        has = con.execute("SELECT 1 FROM article_assignments WHERE contest_id=? AND participant=? "
-                          "AND article=? AND jury=?", (cid, p, a, dst)).fetchone()
-        if has:
-            merged += 1  # ця стаття вже призначена одержувачу — просто знімаємо з джерела
-        else:
-            con.execute("INSERT INTO article_assignments VALUES(?,?,?,?)", (cid, p, a, dst))
-            moved += 1
-        con.execute("DELETE FROM article_assignments WHERE contest_id=? AND participant=? "
-                    "AND article=? AND jury=?", (cid, p, a, src))
-    con.commit()
-    return jsonify(ok=True, moved=moved, merged=merged, kept=kept)
-
-@app.route("/api/state/<cid>")
-@login_required
-def api_state(cid):
-    if not contest_access(cid):
-        return jsonify(error="forbidden"), 403
-    return jsonify(assess=get_assess(cid, None if session["user"]["role"] == "admin"
-                                     else session["user"]["login"]))
-
-# ── Експорт CSV ──────────────────────────────────────────────
-@app.route("/export/<cid>.csv")
-@login_required
-def export_csv(cid):
-    l = lang()
-    t = T[l]
-    quant = request.args.get("quant", "1") == "1"
-    qual = request.args.get("qual", "0") == "1"
-    contest = next((c for c in get_contests() if c["id"] == cid), None)
-    if not contest:
-        return "Not found", 404
-    if not contest_access(cid):
-        return "Forbidden", 403
-    rr = db().execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
-    results = json.loads(rr["data"]) if rr else {}
-    assess = get_assess(cid)
-    legacy = get_legacy(cid)
-    scope = contest.get("review_scope") or "all"
-    show_score = bool((contest.get("formula") or "").strip()) and session["user"]["role"] == "admin"
-    hosts = []
-    for p in contest["projects"]:
-        m = re.match(r"https?://([^/]+)", p)
-        if m:
-            hosts.append(m.group(1))
-
-    rows = []
-    for user in contest["participants"]:
-        r = results.get(user)
-        if r and (r.get("bytes") or 0) < MIN_BYTES:
-            continue  # нижче мінімального порогу
-        a = assess.get(user, {})
-        allowed = scope_titles(r, scope)
-        quality, n = article_quality(a, legacy.get(user), allowed)
-        sp = split_stats(r)
-        score = eval_formula(contest["formula"],
-                             {"bytes": r["bytes"], "edits": r["edits"],
-                              "articles": r["articles"], "quality": quality,
-                              "created": sp["created"], "expanded": sp["expanded"]}) if r else None
-        all_comments = [f"[{t['legacy_title']}] {c['jury']} ({c['date']}): {c['text']}"
-                        for c in (legacy.get(user) or {}).get("comments", [])]
-        for art, ad in a.items():
-            if allowed is not None and art not in allowed:
-                continue
-            for c in ad.get("comments", []):
-                all_comments.append(f"[{art}] {c['jury']} ({c['date']}): {c['text']}")
-        rows.append((user, r, all_comments, quality, n, score))
-    rows.sort(key=lambda x: -(x[5] if (qual and x[5] is not None)
-                              else (x[1]["bytes"] if x[1] else -1)))
-
-    buf = io.StringIO()
-    w = csv.writer(buf, delimiter=",")
-    head = ["#", t["th_u"]]
-    if quant:
-        head += [t["th_b"]] + hosts + [t["th_e"], t["th_split"], t["th_split_b"]]
-    if qual:
-        head += [t["th_avg"]] + ([t["th_score"]] if show_score else []) + [t["comments"]]
-    w.writerow(head)
-    for i, (user, r, all_comments, quality, n, score) in enumerate(rows, 1):
-        line = [i, user]
-        if quant:
-            line.append(r["bytes"] if r else "")
-            for h in hosts:
-                pp = (r or {}).get("perProject", {}).get(h)
-                line.append(pp.get("bytes", t["err"]) if pp else "")
-            line.append(f"{r['edits']} / {r['articles']}" if r else "")
-            sp = split_stats(r) if r else None
-            line.append(f"{sp['created']} / {sp['expanded']}" if sp else "")
-            line.append(f"{sp['bc']} / {sp['be']}" if sp else "")
-        if qual:
-            line.append(round(quality, 2) if n else "")
-            if show_score:
-                line.append(round(score, 2) if score is not None else "")
-            line.append(" | ".join(all_comments))
-        w.writerow(line)
-    safe = re.sub(r"[^\w \-]", "", contest["name"], flags=re.U).strip().replace(" ", "_") or "contest"
-    ascii_fallback = re.sub(r"[^A-Za-z0-9_\-]", "", safe)
-    if not re.search(r"[A-Za-z0-9]", ascii_fallback):
-        ascii_fallback = "contest"
-    utf8_name = quote(safe + ".csv")
-    return Response("\ufeff" + buf.getvalue(),
-                    mimetype="text/csv; charset=utf-8",
-                    headers={"Content-Disposition":
-                             f"attachment; filename=\"{ascii_fallback}.csv\"; filename*=UTF-8''{utf8_name}"})
-
-if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+ {% if me.role=='jury' %}
+ <div class="card" style="max-width:400px;margin-top:14px">
+@@ -1665,16 +1859,42 @@ def get_legacy(cid):
+             {"jury": r["jury_name"], "text": r["text"], "date": r["date"]})
+     return out
+ 
+-def in_scope(it, scope):
+-    """Чи входить стаття (запис зі списку внеску) до обраного адміном обсягу перевірки."""
++def in_scope(it, scope, min_exp=0, min_new=0):
++    """Чи входить стаття (запис зі списку внеску) до обраного адміном обсягу перевірки.
++    Доповнення, у яких додано менше min_exp байтів, і нові статті менші за min_new відсіюються."""
++    if (it.get("bytes") or 0) < (min_new if it.get("created") else min_exp):
++        return False
+     return scope == "all" or (scope == "created") == bool(it.get("created"))
+ 
+-def scope_titles(r, scope):
++def scope_titles(r, scope, min_exp=0, min_new=0):
+     """Назви статей учасника в обсязі перевірки (None = без обмежень)."""
+-    if scope == "all" or not r:
++    if (scope == "all" and not min_exp and not min_new) or not r:
+         return None
+     return {it.get("title") for pp in (r.get("perProject") or {}).values()
+-            for it in (pp.get("list") or []) if in_scope(it, scope)}
++            for it in (pp.get("list") or []) if in_scope(it, scope, min_exp, min_new)}
++
++def parse_min_expand(v):
++    try:
++        return max(0, int(float(str(v).replace(",", ".").strip() or 0)))
++    except (TypeError, ValueError):
++        return 0
++
++def kind_quality(participant_assess, r, scope, min_exp, min_new=0):
++    """Середній бал журі окремо для нових і доповнених статей учасника (у межах обсягу перевірки).
++    Повертає {"created": (середнє|None, кількість оцінених статей), "expanded": (...)}."""
++    kinds = {"created": [], "expanded": []}
++    seen = set()
++    for pp in ((r or {}).get("perProject") or {}).values():
++        for it in (pp.get("list") or []):
++            t = it.get("title")
++            if not t or t in seen or not in_scope(it, scope, min_exp, min_new):
++                continue
++            seen.add(t)
++            vals = [v for v in ((participant_assess or {}).get(t, {}).get("scores") or {}).values()
++                    if v is not None]
++            if vals:
++                kinds["created" if it.get("created") else "expanded"].append(sum(vals) / len(vals))
++    return {k: ((sum(v) / len(v)) if v else None, len(v)) for k, v in kinds.items()}
+ 
+ def article_quality(participant_assess, legacy=None, allowed=None):
+     """Якість учасника = середнє арифметичне середніх оцінок по кожній статті
+@@ -1797,7 +2017,7 @@ def index():
+         cjson=json.dumps({k: v for k, v in contest.items() if me.role == "admin" or k != "jury"},
+                          ensure_ascii=False) if contest else "null",
+         rjson=json.dumps(results, ensure_ascii=False) if results else "null",
+-        ajson=json.dumps(assess, ensure_ascii=False), min_bytes=MIN_BYTES,
++        ajson=json.dumps(assess, ensure_ascii=False),
+         juryjson=json.dumps([{"login": u.login, "name": u.name, "role": u.role,
+                               "inc": u.login in ((contest.jury or []) if contest else [])} for u in users
+                              if me.role == "admin" or u.login == me.login],
+@@ -1816,14 +2036,19 @@ def contest_save():
+         formula = ""  # некоректну формулу не зберігаємо; порожня = формула не використовується
+     cid = f.get("id") or "c" + hex(int(time.time() * 1000))[2:]
+     scope = f.get("review_scope") if f.get("review_scope") in ("all", "created", "expanded") else "all"
+-    db().execute("""INSERT INTO contests VALUES(?,?,?,?,?,?,?,?,?,?)
++    min_exp = parse_min_expand(f.get("min_expand"))
++    min_new = parse_min_expand(f.get("min_created"))
++    min_b = parse_min_expand(f.get("min_bytes"))
++    db().execute("""INSERT INTO contests(id,name,template,projects,participants,formula,start,end,
++        tpl_talk_only,review_scope,min_expand,min_created,min_bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET name=excluded.name,template=excluded.template,
+         projects=excluded.projects,participants=excluded.participants,
+         formula=excluded.formula,start=excluded.start,end=excluded.end,
+-        tpl_talk_only=excluded.tpl_talk_only,review_scope=excluded.review_scope""",
++        tpl_talk_only=excluded.tpl_talk_only,review_scope=excluded.review_scope,
++        min_expand=excluded.min_expand,min_created=excluded.min_created,min_bytes=excluded.min_bytes""",
+         (cid, f.get("name", "").strip(), f.get("template", "").strip(),
+          json.dumps(projects), json.dumps(participants), formula,
+-         f.get("start", ""), f.get("end", ""), 1 if f.get("tpl_talk_only") else 0, scope))
++         f.get("start", ""), f.get("end", ""), 1 if f.get("tpl_talk_only") else 0, scope, min_exp, min_new, min_b))
+     # журі конкурсу: оновлюємо лише склад; оцінки, перевірки та призначення не чіпаємо
+     valid = {r["login"] for r in db().execute("SELECT login FROM users WHERE role='jury'")}
+     chosen = [j for j in f.getlist("jury") if j in valid]
+@@ -1979,16 +2204,19 @@ def api_distribute(cid):
+     results = json.loads(rr["data"]) if rr else {}
+     items, seen = [], set()
+     legacy = get_legacy(cid)
+-    srow = con.execute("SELECT review_scope FROM contests WHERE id=?", (cid,)).fetchone()
++    srow = con.execute("SELECT review_scope, min_expand, min_created, min_bytes FROM contests WHERE id=?", (cid,)).fetchone()
++    min_b = (srow["min_bytes"] if srow else 0) or 0
+     scope = (srow["review_scope"] if srow else None) or "all"
++    min_exp = (srow["min_expand"] if srow else 0) or 0
++    min_new = (srow["min_created"] if srow else 0) or 0
+     for user in sorted(results):
+         if user in legacy and (legacy[user]["scores"] or legacy[user]["comments"]):
+             continue  # внесок уже перевірено в попередній версії
+-        if ((results[user] or {}).get("bytes") or 0) < MIN_BYTES:
++        if ((results[user] or {}).get("bytes") or 0) < min_b:
+             continue  # внесок нижчий за мінімальний поріг
+         for pp in ((results[user] or {}).get("perProject") or {}).values():
+             for it in (pp.get("list") or []):
+-                if not in_scope(it, scope):
++                if not in_scope(it, scope, min_exp, min_new):
+                     continue
+                 k = (user, it.get("title", ""))
+                 if k[1] and k not in seen:
+@@ -2097,6 +2325,48 @@ def api_reassign(cid):
+     con.commit()
+     return jsonify(ok=True, moved=moved, merged=merged, kept=kept)
+ 
++@app.route("/api/min_expand_preview/<cid>")
++@login_required
++def api_min_expand_preview(cid):
++    """Які вже оцінені статті (доповнення й нові) випадуть з перевірки, якщо задати нові мінімуми (лише адмін).
++    Порівнюємо з тим, що діє зараз (збережені обсяг і поріг)."""
++    if session["user"]["role"] != "admin":
++        return jsonify(error="forbidden"), 403
++    con = db()
++    crow = con.execute("SELECT review_scope, min_expand, min_created, min_bytes FROM contests WHERE id=?", (cid,)).fetchone()
++    if not crow:
++        return jsonify(error="not_found"), 404
++    old_scope = crow["review_scope"] or "all"
++    old_min = crow["min_expand"] or 0
++    old_new = crow["min_created"] or 0
++    old_b = crow["min_bytes"] or 0
++    new_b = parse_min_expand(request.args.get("value_bytes")) if "value_bytes" in request.args else old_b
++    new_min = parse_min_expand(request.args.get("value"))
++    new_new = parse_min_expand(request.args.get("value_new")) if "value_new" in request.args else old_new
++    new_scope = request.args.get("scope") if request.args.get("scope") in ("all", "created", "expanded") else old_scope
++    rr = con.execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
++    results = json.loads(rr["data"]) if rr else {}
++    scored = {}
++    for r in con.execute("SELECT participant, article, COUNT(*) n FROM article_scores "
++                         "WHERE contest_id=? AND value IS NOT NULL GROUP BY participant, article", (cid,)):
++        scored[(r["participant"], r["article"])] = r["n"]
++    items, seen = [], set()
++    for user, res in (results or {}).items():
++        ub = (res or {}).get("bytes") or 0
++        for pp in ((res or {}).get("perProject") or {}).values():
++            for it in (pp.get("list") or []):
++                k = (user, it.get("title", ""))
++                if k in seen or k not in scored:
++                    continue
++                old_ok = ub >= old_b and in_scope(it, old_scope, old_min, old_new)
++                new_ok = ub >= new_b and in_scope(it, new_scope, new_min, new_new)
++                if old_ok and not new_ok:
++                    seen.add(k)
++                    items.append({"participant": user, "article": k[1],
++                                  "bytes": it.get("bytes", 0), "scores": scored[k]})
++    items.sort(key=lambda x: (x["participant"], x["article"]))
++    return jsonify(count=len(items), items=items[:15])
++
+ @app.route("/api/state/<cid>")
+ @login_required
+ def api_state(cid):
+@@ -2123,6 +2393,10 @@ def export_csv(cid):
+     assess = get_assess(cid)
+     legacy = get_legacy(cid)
+     scope = contest.get("review_scope") or "all"
++    min_exp = contest.get("min_expand") or 0
++    min_new = contest.get("min_created") or 0
++    min_b = contest.get("min_bytes") or 0
++    sort_key = request.args.get("sort") if request.args.get("sort") in ("qc", "qe") else None
+     show_score = bool((contest.get("formula") or "").strip()) and session["user"]["role"] == "admin"
+     hosts = []
+     for p in contest["projects"]:
+@@ -2133,11 +2407,12 @@ def export_csv(cid):
+     rows = []
+     for user in contest["participants"]:
+         r = results.get(user)
+-        if r and (r.get("bytes") or 0) < MIN_BYTES:
++        if r and (r.get("bytes") or 0) < min_b:
+             continue  # нижче мінімального порогу
+         a = assess.get(user, {})
+-        allowed = scope_titles(r, scope)
++        allowed = scope_titles(r, scope, min_exp, min_new)
+         quality, n = article_quality(a, legacy.get(user), allowed)
++        kq = kind_quality(a, r, scope, min_exp, min_new)
+         sp = split_stats(r)
+         score = eval_formula(contest["formula"],
+                              {"bytes": r["bytes"], "edits": r["edits"],
+@@ -2150,9 +2425,13 @@ def export_csv(cid):
+                 continue
+             for c in ad.get("comments", []):
+                 all_comments.append(f"[{art}] {c['jury']} ({c['date']}): {c['text']}")
+-        rows.append((user, r, all_comments, quality, n, score))
+-    rows.sort(key=lambda x: -(x[5] if (qual and x[5] is not None)
+-                              else (x[1]["bytes"] if x[1] else -1)))
++        rows.append((user, r, all_comments, quality, n, score, kq))
++    if sort_key and qual:
++        kind = "created" if sort_key == "qc" else "expanded"
++        rows.sort(key=lambda x: -(x[6][kind][0] if x[6][kind][0] is not None else -1e18))
++    else:
++        rows.sort(key=lambda x: -(x[5] if (qual and x[5] is not None)
++                                  else (x[1]["bytes"] if x[1] else -1)))
+ 
+     buf = io.StringIO()
+     w = csv.writer(buf, delimiter=",")
+@@ -2160,9 +2439,9 @@ def export_csv(cid):
+     if quant:
+         head += [t["th_b"]] + hosts + [t["th_e"], t["th_split"], t["th_split_b"]]
+     if qual:
+-        head += [t["th_avg"]] + ([t["th_score"]] if show_score else []) + [t["comments"]]
++        head += [t["th_avg"], t["th_avg_c"], t["th_avg_e"]] + ([t["th_score"]] if show_score else []) + [t["comments"]]
+     w.writerow(head)
+-    for i, (user, r, all_comments, quality, n, score) in enumerate(rows, 1):
++    for i, (user, r, all_comments, quality, n, score, kq) in enumerate(rows, 1):
+         line = [i, user]
+         if quant:
+             line.append(r["bytes"] if r else "")
+@@ -2175,6 +2454,8 @@ def export_csv(cid):
+             line.append(f"{sp['bc']} / {sp['be']}" if sp else "")
+         if qual:
+             line.append(round(quality, 2) if n else "")
++            line.append(round(kq["created"][0], 2) if kq["created"][0] is not None else "")
++            line.append(round(kq["expanded"][0], 2) if kq["expanded"][0] is not None else "")
+             if show_score:
+                 line.append(round(score, 2) if score is not None else "")
+             line.append(" | ".join(all_comments))
+diff --git a/test_app.py b/test_app.py
+index 5ecaee4..b3b9c71 100644
+--- a/test_app.py
++++ b/test_app.py
+@@ -451,3 +451,150 @@ def teardown_module(_):
+         os.unlink(_db_path)
+     except OSError:
+         pass
++
++
++# ─────────────────────────────────────────────────────────────
++# Мінімум байтів для доповнень + рейтинг статей за балами журі
++# ─────────────────────────────────────────────────────────────
++class TestMinExpandAndRanking:
++    LIST = [
++        {"title": "Нова мала", "bytes": 300, "created": True},
++        {"title": "Доп велика", "bytes": 5000, "created": False},
++        {"title": "Доп мала", "bytes": 200, "created": False},
++    ]
++
++    def test_in_scope_drops_small_expansions_only(self):
++        small_exp, big_exp, small_new = self.LIST[2], self.LIST[1], self.LIST[0]
++        assert wr.in_scope(small_exp, "all", 0)
++        assert not wr.in_scope(small_exp, "all", 500)
++        assert wr.in_scope(big_exp, "all", 500)
++        assert wr.in_scope(small_new, "all", 500)        # нові не відсіюються
++        assert not wr.in_scope(small_exp, "expanded", 500)
++
++    def test_scope_titles_with_threshold(self):
++        r = {"perProject": {"h": {"list": self.LIST}}}
++        assert wr.scope_titles(r, "all", 0) is None
++        assert wr.scope_titles(r, "all", 500) == {"Нова мала", "Доп велика"}
++
++    def test_parse_min_expand(self):
++        assert wr.parse_min_expand("1500") == 1500
++        assert wr.parse_min_expand("-5") == 0
++        assert wr.parse_min_expand("abc") == 0
++        assert wr.parse_min_expand("") == 0
++
++    def test_kind_quality_separates_created_and_expanded(self):
++        r = {"perProject": {"h": {"list": self.LIST}}}
++        a = {"Нова мала": {"scores": {"j1": 8, "j2": 6}},
++             "Доп велика": {"scores": {"j1": 4}},
++             "Доп мала": {"scores": {"j1": 10}}}
++        kq = wr.kind_quality(a, r, "all", 0)
++        assert kq["created"] == (7.0, 1)
++        assert kq["expanded"] == (7.0, 2)               # (4 + 10) / 2
++        kq = wr.kind_quality(a, r, "all", 500)           # «Доп мала» відсіяна
++        assert kq["expanded"] == (4.0, 1)
++
++    def test_save_min_expand_and_distribute_skips_small(self, admin):
++        make_jury(admin, "jx", "jurypass", "Журі Х")
++        admin.post("/admin/contest/save", data={
++            "id": "cme", "name": "Мін доповнення", "participants": "U1",
++            "projects": "https://uk.wikivoyage.org/wiki/X", "jury": ["jx"],
++            "min_expand": "500", "review_scope": "all"})
++        with wr.app.app_context():
++            row = wr.db().execute("SELECT min_expand FROM contests WHERE id='cme'").fetchone()
++            assert row["min_expand"] == 500
++        admin.post("/api/results/cme", json={"U1": {
++            "bytes": 5500, "edits": 3, "articles": 3,
++            "perProject": {"uk.wikivoyage.org": {"bytes": 5500, "list": self.LIST}}}})
++        resp = admin.post("/api/distribute/cme", json={"per_article": 1})
++        assert resp.get_json()["items"] == 2
++        with wr.app.app_context():
++            arts = {r["article"] for r in wr.db().execute(
++                "SELECT article FROM article_assignments WHERE contest_id='cme'")}
++        assert arts == {"Нова мала", "Доп велика"}
++
++    def test_export_has_split_score_columns_and_sort(self, admin):
++        admin.post("/admin/contest/save", data={
++            "id": "cex", "name": "Експорт", "participants": "A\nB",
++            "projects": "https://uk.wikivoyage.org/wiki/X"})
++        mk = lambda b: {"bytes": b, "edits": 1, "articles": 2, "perProject": {"uk.wikivoyage.org": {
++            "bytes": b, "list": [{"title": f"n{b}", "bytes": b, "created": True},
++                                 {"title": f"e{b}", "bytes": b, "created": False}]}}}
++        admin.post("/api/results/cex", json={"A": mk(2000), "B": mk(3000)})
++        with wr.app.app_context():
++            con = wr.db()
++            for p, art, v in (("A", "n2000", 9), ("A", "e2000", 3), ("B", "n3000", 2), ("B", "e3000", 8)):
++                con.execute("INSERT INTO article_scores VALUES('cex',?,?,?,?)", (p, art, "j", v))
++            con.commit()
++        body = admin.get("/export/cex.csv?quant=1&qual=1&sort=qc").data.decode("utf-8-sig")
++        lines = body.strip().splitlines()
++        assert "Бал: нові" in lines[0] and "Бал: доповнені" in lines[0]
++        assert lines[1].split(",")[1] == "A"             # A має вищий бал за нові
++        body = admin.get("/export/cex.csv?quant=1&qual=1&sort=qe").data.decode("utf-8-sig")
++        assert body.strip().splitlines()[1].split(",")[1] == "B"
++
++
++class TestMinExpandPreview:
++    def test_preview_lists_scored_expansions_that_would_drop(self, admin):
++        admin.post("/admin/contest/save", data={
++            "id": "cpv", "name": "Прев'ю", "participants": "P",
++            "projects": "https://uk.wikivoyage.org/wiki/X"})
++        lst = [{"title": "Нова", "bytes": 50, "created": True},
++               {"title": "Мала доп", "bytes": 200, "created": False},
++               {"title": "Велика доп", "bytes": 5000, "created": False},
++               {"title": "Мала без оцінки", "bytes": 100, "created": False}]
++        admin.post("/api/results/cpv", json={"P": {"bytes": 5350, "edits": 1, "articles": 4,
++                   "perProject": {"h": {"bytes": 5350, "list": lst}}}})
++        for a in ("Нова", "Мала доп", "Велика доп"):
++            admin.post("/api/score", json={"contest": "cpv", "participant": "P", "article": a, "value": 7})
++        d = admin.get("/api/min_expand_preview/cpv?value=1000").get_json()
++        assert d["count"] == 1 and d["items"][0]["article"] == "Мала доп"   # нова й без оцінки не рахуються
++        assert admin.get("/api/min_expand_preview/cpv?value=0").get_json()["count"] == 0
++
++    def test_preview_admin_only(self, admin):
++        make_jury(admin, "jp", "jurypass", "Журі П")
++        login_as(admin, "jp", "jurypass")
++        assert admin.get("/api/min_expand_preview/cpv?value=10").status_code == 403
++
++
++class TestMinCreated:
++    def test_in_scope_min_new(self):
++        new_small = {"title": "n", "bytes": 3000, "created": True}
++        new_big = {"title": "N", "bytes": 4000, "created": True}
++        exp_small = {"title": "e", "bytes": 3000, "created": False}
++        assert not wr.in_scope(new_small, "all", 0, 3500)
++        assert wr.in_scope(new_big, "all", 0, 3500)
++        assert wr.in_scope(exp_small, "all", 0, 3500)          # поріг нових не діє на доповнення
++        assert not wr.in_scope(exp_small, "all", 3500, 0)
++        assert wr.scope_titles({"perProject": {"h": {"list": [new_small, new_big]}}}, "all", 0, 3500) == {"N"}
++
++    def test_save_and_distribute_with_min_created(self, admin):
++        make_jury(admin, "jm", "jurypass", "Журі М")
++        admin.post("/admin/contest/save", data={
++            "id": "cmc", "name": "Мін нова", "participants": "U", "jury": ["jm"],
++            "projects": "https://uk.wikivoyage.org/wiki/X", "min_created": "3500", "min_expand": "3500"})
++        lst = [{"title": "Нова мала", "bytes": 3000, "created": True},
++               {"title": "Нова ок", "bytes": 4000, "created": True},
++               {"title": "Доп мала", "bytes": 3000, "created": False},
++               {"title": "Доп ок", "bytes": 3600, "created": False}]
++        admin.post("/api/results/cmc", json={"U": {"bytes": 13600, "edits": 4, "articles": 4,
++                   "perProject": {"h": {"bytes": 13600, "list": lst}}}})
++        assert admin.post("/api/distribute/cmc", json={}).get_json()["items"] == 2
++        admin.post("/api/score", json={"contest": "cmc", "participant": "U", "article": "Нова ок", "value": 5})
++        d = admin.get("/api/min_expand_preview/cmc?value=3500&value_new=4500").get_json()
++        assert d["count"] == 1 and d["items"][0]["article"] == "Нова ок"   # 4000 < 4500
++        assert admin.get("/api/min_expand_preview/cmc?value=3500&value_new=3500").get_json()["count"] == 0
++        d = admin.get("/api/min_expand_preview/cmc?value=3500&value_new=3500&value_bytes=99999").get_json()
++        assert d["count"] == 1    # поріг внеску учасника теж відсіює
++
++
++class TestMinBytesConfigurable:
++    def test_default_is_off_and_configurable(self, admin):
++        make_jury(admin, "jb", "jurypass", "Журі Б")
++        for cid, mb in (("cb0", ""), ("cb1", "5000")):
++            admin.post("/admin/contest/save", data={
++                "id": cid, "name": cid, "participants": "S", "jury": ["jb"],
++                "projects": "https://uk.wikivoyage.org/wiki/X", "min_bytes": mb})
++            admin.post(f"/api/results/{cid}", json={"S": {"bytes": 2000, "edits": 1, "articles": 1,
++                       "perProject": {"h": {"bytes": 2000, "list": [{"title": "T", "bytes": 2000, "created": True}]}}}})
++        assert admin.post("/api/distribute/cb0", json={}).get_json().get("items") == 1   # без порога
++        assert admin.post("/api/distribute/cb1", json={}).status_code == 400            # 2000 < 5000
