@@ -587,6 +587,8 @@ _RANK = {
    top_title="Найвищі бали журі", top_created="Нові статті", top_expanded="Доповнені статті",
    top_show="Показати", top_none="Оцінених статей ще немає",
    top_h="Рейтинг статей за середнім балом журі — окремо створені та окремо доповнені.",
+   top_csv="Експорт CSV ↓", tip_top_csv="Завантажити повні рейтинги (усі оцінені статті, а не лише показані) у CSV",
+   top_c_type="Тип", top_c_article="Стаття", top_c_score="Сер. бал", top_c_n="Оцінок", top_c_link="Посилання",
    me_warn="⚠ Після збереження з перевірки випаде оцінених статей: {n}. Оцінки лишаться в базі, але не враховуватимуться в якості й балах.",
    me_ok="Оцінених статей, що випадуть, немає.",
    me_confirm="Відсіяти оцінені статті ({n})? Їхні оцінки більше не враховуватимуться в якості й балах (у базі вони лишаться).",
@@ -611,6 +613,8 @@ _RANK = {
    top_title="Top jury scores", top_created="New articles", top_expanded="Expanded articles",
    top_show="Show", top_none="No scored articles yet",
    top_h="Articles ranked by average jury score — new and expanded separately.",
+   top_csv="Export CSV ↓", tip_top_csv="Download the full rankings (all scored articles, not only the shown ones) as CSV",
+   top_c_type="Type", top_c_article="Article", top_c_score="Avg score", top_c_n="Scores", top_c_link="Link",
    me_warn="⚠ After saving, scored articles that will drop out of the review: {n}. The scores stay in the database but will not count toward quality and scores.",
    me_ok="No scored articles will drop out.",
    me_confirm="Drop scored articles ({n})? Their scores will stop counting toward quality and scores (they stay in the database).",
@@ -635,6 +639,8 @@ _RANK = {
    top_title="Najwyższe oceny jury", top_created="Nowe artykuły", top_expanded="Rozbudowane artykuły",
    top_show="Pokaż", top_none="Brak ocenionych artykułów",
    top_h="Artykuły według średniej oceny jury — osobno nowe i rozbudowane.",
+   top_csv="Eksport CSV ↓", tip_top_csv="Pobierz pełne rankingi (wszystkie ocenione artykuły, nie tylko pokazane) jako CSV",
+   top_c_type="Typ", top_c_article="Artykuł", top_c_score="Śr. ocena", top_c_n="Ocen", top_c_link="Link",
    me_warn="⚠ Po zapisaniu z oceny wypadną ocenione artykuły: {n}. Oceny zostaną w bazie, ale nie będą liczone w jakości i wynikach.",
    me_ok="Żadne ocenione artykuły nie wypadną.",
    me_confirm="Pominąć ocenione artykuły ({n})? Ich oceny przestaną się liczyć w jakości i wynikach (zostaną w bazie).",
@@ -1067,7 +1073,20 @@ function topArticles(rows){
  const cmp=(a,b)=>(b.avg-a.avg)||(b.n-a.n)||(b.bytes-a.bytes);
  out.created.sort(cmp);out.expanded.sort(cmp);return out;
 }
+let TOP_ROWS=[];
+// вивантаження повних рейтингів (усі оцінені статті) у CSV з BOM для Excel
+function exportTop(){
+ const tp=topArticles(TOP_ROWS),NL=String.fromCharCode(13,10);
+ const q=v=>'"'+String(v).replace(/"/g,'""')+'"';
+ const lines=[['#',T.top_c_type,T.top_c_article,T.th_u,T.th_b,T.top_c_score,T.top_c_n,T.top_c_link].map(q).join(',')];
+ [['created',T.created],['expanded',T.expanded]].forEach(([k,lbl])=>tp[k].forEach((x,i)=>
+  lines.push([i+1,lbl,x.title,x.user,x.bytes,x.avg.toFixed(2),x.n,articleLink(x.origin,x.title)].map(q).join(','))));
+ const a=document.createElement('a');
+ a.href=URL.createObjectURL(new Blob([String.fromCharCode(0xFEFF)+lines.join(NL)],{type:'text/csv;charset=utf-8'}));
+ a.download='top-articles-'+CID+'.csv';document.body.appendChild(a);a.click();a.remove();
+}
 function topHtml(rows){
+ TOP_ROWS=rows;
  const tp=topArticles(rows);
  const mx=Math.max(1,...tp.created.concat(tp.expanded).map(x=>x.avg));
  const col=(lbl,list,clr)=>{
@@ -1082,7 +1101,7 @@ function topHtml(rows){
     +'<span class="mono" style="font-weight:700;text-align:right">'+x.avg.toFixed(2)+'</span></div>'});
   return h+'</div>'};
  let h='<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px"><h3 style="margin:0">'+esc(T.top_title)+'</h3>'
-  +'<span class="hint">'+esc(T.top_h)+'</span><span style="margin-left:auto" class="hint">'+esc(T.top_show)+' <select onchange="setTopN(this.value)" style="width:auto;padding:2px 6px">'
+  +'<span class="hint">'+esc(T.top_h)+'</span><span style="margin-left:auto;display:flex;gap:10px;align-items:center" class="hint"><button class="btn-s" style="padding:4px 10px;font-size:12px" title="'+esc(T.tip_top_csv)+'" onclick="exportTop()">'+esc(T.top_csv)+'</button>'+esc(T.top_show)+' <select onchange="setTopN(this.value)" style="width:auto;padding:2px 6px">'
   +[5,10,25,50].map(n=>'<option value="'+n+'"'+(n===TOPN?' selected':'')+'>'+n+'</option>').join('')+'</select></span></div>';
  h+='<div style="display:flex;flex-wrap:wrap;gap:24px">'+col(T.top_created,tp.created,'#1d7a4f')+col(T.top_expanded,tp.expanded,'var(--acc)')+'</div>';
  return h;
