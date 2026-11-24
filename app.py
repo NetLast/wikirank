@@ -80,6 +80,9 @@ CREATE TABLE IF NOT EXISTS article_reviews(
 CREATE TABLE IF NOT EXISTS article_assignments(
   contest_id TEXT, participant TEXT, article TEXT, jury TEXT,
   PRIMARY KEY(contest_id, participant, article, jury));
+CREATE TABLE IF NOT EXISTS article_excluded(
+  contest_id TEXT, participant TEXT, article TEXT, reason TEXT, by_name TEXT, date TEXT,
+  PRIMARY KEY(contest_id, participant, article));
 CREATE TABLE IF NOT EXISTS contest_jury(
   contest_id TEXT, login TEXT, PRIMARY KEY(contest_id, login));
 CREATE TABLE IF NOT EXISTS patrol_results(
@@ -672,6 +675,18 @@ _A11Y = {
  'pl': dict(help_btn="Więcej szczegółów", contest_sel="Konkurs", a11y_actions="Akcje", progress="Postęp", dlg_frame="Artykuł w oknie", sort_hint="Sortuj"),
 }
 for _l, _d in _A11Y.items():
+    T[_l].update(_d)
+
+_EXCL = {'uk': {'excl_btn': 'Не зараховувати цю статтю', 'excl_reason': 'Причина', 'excl_ph': 'Наприклад: переклад без доповнення', 'excl_p1': 'Переклад без доповнення', 'excl_p2': 'Недостатній обсяг', 'excl_p3': 'Порушення правил конкурсу', 'excl_confirm': 'Не зараховувати', 'excl_undo': 'Повернути в залік', 'excl_badge': 'Не зараховано', 'excl_banner': 'Не зараховується', 'excl_by': 'позначив(ла)', 'excl_h': 'Стаття не потрапляє в середні бали, рейтинги й експорт. Оцінки журі не видаляються: після повернення в залік вони знову діятимуть.', 'excl_orig': 'Оцінка журі (не враховується)', 'attn_title': 'Потребує уваги', 'attn_h': 'Статті з середнім балом 0 (перевірте, чи це навмисно) і статті, позначені як не зараховувані. Клікніть на назву, щоб відкрити статтю.', 'attn_zero': 'Оцінка 0', 'attn_excl': 'Не зараховано', 'attn_none': 'Немає'}, 'en': {'excl_btn': 'Do not count this article', 'excl_reason': 'Reason', 'excl_ph': 'E.g. translation without expansion', 'excl_p1': 'Translation without expansion', 'excl_p2': 'Not enough size', 'excl_p3': 'Violates contest rules', 'excl_confirm': 'Do not count', 'excl_undo': 'Count it again', 'excl_badge': 'Not counted', 'excl_banner': 'Not counted', 'excl_by': 'marked by', 'excl_h': 'The article is left out of averages, rankings and exports. Jury scores are not deleted: they apply again once the article is counted again.', 'excl_orig': 'Jury score (not counted)', 'attn_title': 'Needs attention', 'attn_h': 'Articles with an average score of 0 (check that it is intentional) and articles marked as not counted. Click a title to open the article.', 'attn_zero': 'Score 0', 'attn_excl': 'Not counted', 'attn_none': 'None'}, 'pl': {'excl_btn': 'Nie zaliczaj tego artykułu', 'excl_reason': 'Powód', 'excl_ph': 'Np. tłumaczenie bez rozbudowy', 'excl_p1': 'Tłumaczenie bez rozbudowy', 'excl_p2': 'Za mały rozmiar', 'excl_p3': 'Naruszenie regulaminu konkursu', 'excl_confirm': 'Nie zaliczaj', 'excl_undo': 'Zalicz ponownie', 'excl_badge': 'Niezaliczony', 'excl_banner': 'Nie jest zaliczany', 'excl_by': 'oznaczył(a)', 'excl_h': 'Artykuł nie wchodzi do średnich, rankingów i eksportu. Oceny jury nie są usuwane: po ponownym zaliczeniu znów obowiązują.', 'excl_orig': 'Ocena jury (nie jest liczona)', 'attn_title': 'Wymaga uwagi', 'attn_h': 'Artykuły ze średnią oceną 0 (sprawdź, czy to celowe) i artykuły oznaczone jako niezaliczane. Kliknij tytuł, aby otworzyć artykuł.', 'attn_zero': 'Ocena 0', 'attn_excl': 'Niezaliczone', 'attn_none': 'Brak'}}
+for _l, _d in _EXCL.items():
+    T[_l].update(_d)
+
+_SCSV = {
+ 'uk': dict(scores_csv="Усі оцінки (CSV)", tip_scores_csv="Вивантажити всі оцінки журі: кожна перевірена стаття, кожен член журі окремим рядком"),
+ 'en': dict(scores_csv="All scores (CSV)", tip_scores_csv="Download all jury scores: every reviewed article, one row per jury member"),
+ 'pl': dict(scores_csv="Wszystkie oceny (CSV)", tip_scores_csv="Pobierz wszystkie oceny jury: każdy sprawdzony artykuł, jeden wiersz na jurora"),
+}
+for _l, _d in _SCSV.items():
     T[_l].update(_d)
 
 import re as _re
@@ -1445,6 +1460,41 @@ function topArticles(rows){
  const cmp=(a,b)=>(b.avg-a.avg)||(b.n-a.n)||(b.bytes-a.bytes);
  out.created.sort(cmp);out.expanded.sort(cmp);return out;
 }
+async function excludeM(on){
+ if(!MODAL)return;
+ const inp=document.getElementById('exclReason');
+ const reason=on&&inp?inp.value.trim():'';
+ if(on&&!reason){if(inp)inp.focus();return}
+ await fetch('/api/exclude',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({contest:CID,participant:MODAL.user,article:MODAL.title,excluded:on,reason})});
+ await reloadState();render();
+}
+let ATTN_LIST=[];
+function openAttn(i){const it=ATTN_LIST[i];if(it){CUR_LIST=ATTN_LIST;openItem(it)}}
+// «Потребує уваги»: статті з середнім балом 0 і статті, позначені «не зараховується»
+function attnHtml(rows){
+ const zero=[],excl=[];
+ rows.forEach(row=>projects.forEach(p=>{
+  const pp=row.r?row.r.perProject[p.host]:null;
+  (pp&&pp.list?pp.list:[]).forEach(it=>{
+   const a=slot(row.user,it.title);const base={...it,user:row.user,origin:p.origin,label:p.label,host:p.host,api:p.api};
+   if(a.excluded){excl.push({...base,reason:a.excluded.reason});return}
+   if(!inScope(it))return;
+   const vals=Object.values(a.scores||{}).filter(v=>v!=null);
+   if(vals.length&&vals.reduce((x,y)=>x+y,0)===0)zero.push(base)})}));
+ ATTN_LIST=zero.concat(excl);
+ const list=(title,arr,off,extra)=>{
+  let h='<div style="flex:1;min-width:300px"><div class="lbl" style="margin:0 0 6px">'+esc(title)+' <span class="hint">('+arr.length+')</span></div>';
+  if(!arr.length)return h+'<div class="hint">'+esc(T.attn_none)+'</div></div>';
+  arr.slice(0,50).forEach((x,i)=>{h+='<div style="padding:3px 0"><button type="button" class="thbtn" style="font-weight:400;color:var(--cdx-prog);text-align:left" onclick="openAttn('+(off+i)+')">'+esc(x.title)+'</button>'
+   +'<div class="hint">'+esc(x.user)+' · +'+fmtN(x.bytes)+BU+(extra?' · '+esc(x.reason):'')+'</div></div>'});
+  if(arr.length>50)h+='<div class="hint">…</div>';
+  return h+'</div>'};
+ const open=(zero.length||excl.length)?'':'';
+ return '<details'+(excl.length?' open':'')+'><summary style="cursor:pointer;min-height:24px"><h2 style="display:inline;margin:0">'+esc(T.attn_title)+'</h2> <span class="hint">· '+esc(T.attn_zero)+': '+zero.length+' · '+esc(T.attn_excl)+': '+excl.length+'</span></summary>'
+  +'<div style="margin:6px 0 10px">'+hintHelp(T.attn_h)+'</div>'
+  +'<div style="display:flex;flex-wrap:wrap;gap:24px">'+list(T.attn_zero,zero,0,false)+list(T.attn_excl,excl,zero.length,true)+'</div></details>';
+}
 let TOP_ROWS=[];
 // вивантаження повних рейтингів (усі оцінені статті) у CSV з BOM для Excel
 function exportTop(){
@@ -1483,7 +1533,7 @@ function legacyVals(user){const l=LEGACY[user];return l?Object.values(l.scores||
 function setArtFilter(f){ART_FILTER=f;SCROLL_RESET=true;render()}
 function setRevFilter(f){REV_FILTER=f;SCROLL_RESET=true;render()}
 function articleLink(origin,title){return origin+'/wiki/'+encodeURIComponent(title.replace(/ /g,'_'))}
-function slot(user,title){const a=ASSESS[user]&&ASSESS[user][title];return a||{scores:{},comments:[],reviewed:[],assigned:[]}}
+function slot(user,title){const a=ASSESS[user]&&ASSESS[user][title];return a||{scores:{},comments:[],reviewed:[],assigned:[],excluded:null,raw_scores:{}}}
 function isReviewed(user,title){return legacyDone(user)||(slot(user,title).reviewed||[]).indexOf(JURY_LOGIN)>=0}
 function isMine(user,title){return (slot(user,title).assigned||[]).indexOf(JURY_LOGIN)>=0}
 function juryName(login){const j=JURY_LIST.find(x=>x.login===login);return j?j.name:login}
@@ -1814,7 +1864,8 @@ function rightHtml(){
  const ad=slot(m.user,m.title);
  const vals=Object.values(ad.scores||{}).filter(v=>v!=null);
  const avg=vals.length?(vals.reduce((x,y)=>x+y,0)/vals.length):null;
- const my=(ad.scores||{})[JURY_LOGIN];
+ const ex=ad.excluded;
+ const my=((ex?ad.raw_scores:ad.scores)||{})[JURY_LOGIN];
  const rev=isReviewed(m.user,m.title);
  const idx=modalIdx();
  const cid=idFor(m.user+'||'+m.title);
@@ -1832,8 +1883,22 @@ function rightHtml(){
  if((ad.assigned||[]).length)h+='<div class="hint" style="margin-top:4px">'+T.assigned_to+': '+ad.assigned.map(l=>esc(juryName(l))).join(', ')+'</div>';
  h+='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px">';
  h+='<label class="hint" style="" title="'+esc(T.tip_my_score)+'">'+T.th_my+':</label>';
- h+='<input type="number" step="0.1" aria-label="'+esc(T.tip_my_score)+'" title="'+esc(T.tip_my_score)+'" style="width:70px" value="'+(my??'')+'" onchange="saveScoreM(this.value)">';
+ h+='<input type="number" step="0.1" aria-label="'+esc(T.tip_my_score)+'" title="'+esc(T.tip_my_score)+'" style="width:70px" value="'+(my??'')+'" '+(ex?'disabled ':'')+'onchange="saveScoreM(this.value)">';
  h+='<span class="hint mono">'+T.th_avg+': '+(avg!=null?avg.toFixed(2):'—')+(vals.length?' ('+vals.length+' '+T.scores_n+')':'')+'</span></div>';
+
+ if(ex){
+  h+='<div role="status" style="margin-top:12px;padding:10px 12px;border:1px solid var(--cdx-warn);background:var(--cdx-warn-subtle);border-radius:var(--cdx-radius)">'
+   +'<b>'+esc(T.excl_banner)+'</b>: '+esc(ex.reason)+'<div class="hint">'+esc(T.excl_by)+' '+esc(ex.by||'')+' · '+esc(ex.date||'')+'</div>'
+   +(Object.keys(ad.raw_scores||{}).length?'<div class="hint">'+esc(T.excl_orig)+': '+Object.values(ad.raw_scores).map(v=>v==null?'—':v).join(', ')+'</div>':'')
+   +'<button class="btn-s" style="margin-top:8px" onclick="excludeM(false)">'+esc(T.excl_undo)+'</button></div>';
+ }else{
+  h+='<details style="margin-top:12px"><summary style="cursor:pointer;min-height:24px">'+esc(T.excl_btn)+'</summary>'
+   +'<div style="padding:8px 0"><label class="lbl" for="exclReason" style="margin-top:0">'+esc(T.excl_reason)+'</label>'
+   +'<input id="exclReason" list="exclList" maxlength="300" placeholder="'+esc(T.excl_ph)+'">'
+   +'<datalist id="exclList"><option value="'+esc(T.excl_p1)+'"><option value="'+esc(T.excl_p2)+'"><option value="'+esc(T.excl_p3)+'"></datalist>'
+   +hintHelp(T.excl_h,'margin-top:4px')
+   +'<button class="btn-d" style="margin-top:8px" onclick="excludeM(true)">'+esc(T.excl_confirm)+'</button></div></details>';
+ }
  h+='<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">';
  h+='<button class="btn-p" title="'+esc(rev?T.tip_next_btn:T.tip_rev_next)+'" onclick="reviewAndNext()">'+(rev?T.next+' ›':T.rev_next)+'</button></div>';
  h+='<div style="margin-top:14px">';
@@ -2060,6 +2125,7 @@ function render(){
       if(CONTEST.opt_refs&&it.refs!=null)h+='<span class="chip" style="font-size:12px" title="'+esc(T.tip_chip_refs)+'">'+T.chip_refs+' +'+it.refs+'</span>';
       if(CONTEST.opt_images&&it.images!=null)h+='<span class="chip" style="font-size:12px" title="'+esc(T.tip_chip_images)+'">'+T.chip_images+' +'+it.images+'</span>';
       if(it.st)h+='<span class="chip" style="font-size:12px;background:var(--cdx-warn-subtle);color:var(--cdx-warn)">'+(it.st==='featured'?T.status_featured:(it.st==='list'?T.status_list:T.status_good))+'</span>';
+      if(ad.excluded)h+='<span class="chip" style="background:var(--cdx-warn-subtle);color:var(--cdx-warn)" title="'+esc(ad.excluded.reason)+'">'+esc(T.excl_badge)+'</span>';
       if(mine)h+='<span class="chip tag-a" style="font-size:12px">'+T.mine+'</span>';
       if(avg!=null)h+='<span class="chip" style="font-size:12px;background:var(--cdx-warn-subtle);color:var(--cdx-warn)">★ '+avg.toFixed(1)+'</span>';
       if(nCm)h+='<span class="hint" style="">💬'+nCm+'</span>';
@@ -2081,6 +2147,8 @@ function render(){
   h+='<div class="hint" style="padding:8px 12px">'+T.hidden_exp+' ('+fmtN(MIN_NEW)+' / '+fmtN(MIN_EXP)+BU+'): '+hiddenE+'</div>';
  }
  el.innerHTML=h;
+ const ab=document.getElementById('attnbox');
+ if(ab){if(QUAL&&!IS_JURY){ab.style.display='block';ab.innerHTML=attnHtml(rows)}else{ab.style.display='none';ab.innerHTML=''}}
  const tb=document.getElementById('topbox');
  if(tb){if(QUAL&&!IS_JURY){tb.style.display='block';tb.innerHTML=topHtml(rows)}else{tb.style.display='none';tb.innerHTML=''}}
  const nc=el.querySelector('.carousel');if(nc&&keepScroll)nc.scrollLeft=keepScroll;
@@ -2293,7 +2361,9 @@ ANALYSIS_TPL = """
  <div style="margin-left:auto;text-align:right;min-width:280px">
   <div style="display:flex;gap:8px;justify-content:flex-end">
    <a id="csvlink" title="{{t.tip_export}}" class="btn-s" style="text-decoration:none;padding:8px 14px" href="/export/{{cid}}.csv?quant=1&qual=0">{{t.export}}</a>
+   
    {% if me.role=='admin' %}
+   <a id="scorescsv" title="{{t.tip_scores_csv}}" class="btn-s" style="text-decoration:none;padding:8px 14px" href="/export/{{cid}}/scores.csv">{{t.scores_csv}}</a>
    <button id="runbtn" class="btn-p" title="{{t.tip_check}}" onclick="runCheck()">{{t.check}}</button>
    {% else %}
    <span class="hint" style="align-self:center;max-width:200px;text-align:right">{{t.jury_no_check}}</span>
@@ -2334,6 +2404,7 @@ ANALYSIS_TPL = """
 </div>
 <div class="card" style="padding:0;overflow-x:auto"><div id="tbl"></div></div>
 <div id="topbox" class="card" style="display:none"></div>
+<div id="attnbox" class="card" style="display:none"></div>
 <div class="hint">{% if me.role=='admin' %}{{t.f_of}} <span class="chip">{{contest.formula if contest.formula else '—'}}</span> · {% endif %}{{t.scope_label}} <span class="chip">{{t['scope_'~(contest.review_scope or 'all')]}}</span>{% if contest.min_bytes %} · {{t.min_bytes_chip}} <span class="chip">{{contest.min_bytes}} {{t.bytes_unit}}</span>{% endif %}{% if contest.min_created %} · {{t.min_created_chip}} <span class="chip">{{contest.min_created}} {{t.bytes_unit}}</span>{% endif %}{% if contest.min_expand %} · {{t.min_expand_chip}} <span class="chip">{{contest.min_expand}} {{t.bytes_unit}}</span>{% endif %}</div>
 {% endif %}
 {% if me.role=='jury' %}
@@ -2381,10 +2452,17 @@ def get_assess(cid, only=None):
 
     def slot(p, a):
         return assess.setdefault(p, {}).setdefault(
-            a, {"scores": {}, "comments": [], "reviewed": [], "assigned": []})
+            a, {"scores": {}, "comments": [], "reviewed": [], "assigned": [],
+                   "excluded": None, "raw_scores": {}})
 
     for r in db().execute("SELECT * FROM article_scores WHERE contest_id=?", (cid,)):
         slot(r["participant"], r["article"])["scores"][r["jury"]] = r["value"]
+    # статті, позначені «не зараховується»: оцінки лишаються в базі, але ніде не враховуються
+    for r in db().execute("SELECT * FROM article_excluded WHERE contest_id=?", (cid,)):
+        sl = slot(r["participant"], r["article"])
+        sl["excluded"] = {"reason": r["reason"], "by": r["by_name"], "date": r["date"]}
+        sl["raw_scores"] = dict(sl["scores"])
+        sl["scores"] = {}
     for r in db().execute(
             "SELECT * FROM article_comments WHERE contest_id=? ORDER BY id", (cid,)):
         slot(r["participant"], r["article"])["comments"].append(
@@ -2691,7 +2769,7 @@ def contest_save():
 def contest_delete():
     cid = request.form["id"]
     for tbl in ("contests", "results", "scores", "comments", "article_scores",
-                "article_comments", "article_reviews", "article_assignments", "contest_jury",
+                "article_comments", "article_reviews", "article_assignments", "contest_jury", "article_excluded",
                 "patrol_results"):
         db().execute(f"DELETE FROM {tbl} WHERE {'id' if tbl=='contests' else 'contest_id'}=?", (cid,))
     db().commit()
@@ -2792,6 +2870,28 @@ def api_score():
         # виставлена оцінка автоматично означає, що статтю перевірено
         db().execute("INSERT OR IGNORE INTO article_reviews VALUES(?,?,?,?)",
                      (d["contest"], d["participant"], article, me))
+    db().commit()
+    return jsonify(ok=True)
+
+@app.route("/api/exclude", methods=["POST"])
+@login_required
+def api_exclude():
+    """Позначка «не зараховується» з причиною (або повернення в залік)."""
+    d = request.get_json()
+    if not contest_access(d["contest"]):
+        return jsonify(error="forbidden"), 403
+    key = (d["contest"], d["participant"], d.get("article", ""))
+    if d.get("excluded"):
+        reason = (d.get("reason") or "").strip()[:300]
+        if not reason:
+            return jsonify(error="reason required"), 400
+        db().execute("INSERT OR REPLACE INTO article_excluded VALUES(?,?,?,?,?,?)",
+                     key + (reason, session["user"]["name"], time.strftime("%Y-%m-%d %H:%M")))
+        # позначена стаття вважається перевіреною
+        db().execute("INSERT OR IGNORE INTO article_reviews VALUES(?,?,?,?)",
+                     key + (session["user"]["login"],))
+    else:
+        db().execute("DELETE FROM article_excluded WHERE contest_id=? AND participant=? AND article=?", key)
     db().commit()
     return jsonify(ok=True)
 
@@ -3124,6 +3224,67 @@ def export_csv(cid):
                     mimetype="text/csv; charset=utf-8",
                     headers={"Content-Disposition":
                              f"attachment; filename=\"{ascii_fallback}.csv\"; filename*=UTF-8''{utf8_name}"})
+
+@app.route("/export/<cid>/scores.csv")
+@admin_required
+def export_scores(cid):
+    """Усі оцінки журі: по рядку на кожну пару «перевірена стаття — член журі» (лише адмін)."""
+    contest = next((c for c in get_contests() if c["id"] == cid), None)
+    if not contest:
+        return "Not found", 404
+    l = lang()
+    H = {
+        "uk": ["Учасник", "Стаття", "Тип", "Додано байтів", "Посилання", "Член журі", "Оцінка",
+               "Перевірено", "Не зараховується", "Причина", "Середній бал статті", "Коментарі журі"],
+        "en": ["Participant", "Article", "Type", "Bytes added", "Link", "Jury member", "Score",
+               "Reviewed", "Not counted", "Reason", "Article average", "Jury comments"],
+        "pl": ["Uczestnik", "Artykuł", "Typ", "Dodane bajty", "Link", "Juror", "Ocena",
+               "Sprawdzony", "Niezaliczony", "Powód", "Średnia artykułu", "Komentarze jury"],
+    }[l]
+    YES, NO = {"uk": ("так", "ні"), "en": ("yes", "no"), "pl": ("tak", "nie")}[l]
+    KIND = {"uk": ("створено", "доповнено"), "en": ("created", "expanded"), "pl": ("utworzony", "rozbudowany")}[l]
+    rr = db().execute("SELECT data FROM results WHERE contest_id=?", (cid,)).fetchone()
+    results = json.loads(rr["data"]) if rr else {}
+    meta = {}
+    for user, r in results.items():
+        for host, pp in ((r or {}).get("perProject") or {}).items():
+            for it in (pp.get("list") or []):
+                meta.setdefault((user, it.get("title")), (host, it))
+    names = {u["login"]: u["name"] for u in db().execute("SELECT login, name FROM users")}
+    scores, reviewed, excluded, comments = {}, set(), {}, {}
+    for r in db().execute("SELECT * FROM article_scores WHERE contest_id=?", (cid,)):
+        scores[(r["participant"], r["article"], r["jury"])] = r["value"]
+    for r in db().execute("SELECT * FROM article_reviews WHERE contest_id=?", (cid,)):
+        reviewed.add((r["participant"], r["article"], r["jury"]))
+    for r in db().execute("SELECT * FROM article_excluded WHERE contest_id=?", (cid,)):
+        excluded[(r["participant"], r["article"])] = r["reason"]
+    for r in db().execute("SELECT * FROM article_comments WHERE contest_id=? ORDER BY id", (cid,)):
+        comments.setdefault((r["participant"], r["article"]), []).append(
+            f"{r['jury_name']} ({r['date']}): {r['text']}")
+    keys = set(scores) | reviewed
+    by_art = {}
+    for (p_, a_, j_) in keys:
+        by_art.setdefault((p_, a_), set()).add(j_)
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=",")
+    w.writerow(H)
+    for (p_, a_) in sorted(by_art):
+        host, it = meta.get((p_, a_), (None, None))
+        link = f"https://{host}/wiki/{quote(a_.replace(' ', '_'))}" if host else ""
+        kind = (KIND[0] if it.get("created") else KIND[1]) if it else ""
+        vals = [scores[(p_, a_, j)] for j in by_art[(p_, a_)] if scores.get((p_, a_, j)) is not None]
+        ex = excluded.get((p_, a_))
+        avg = round(sum(vals) / len(vals), 2) if (vals and ex is None) else ""
+        cm = " | ".join(comments.get((p_, a_), []))
+        for j in sorted(by_art[(p_, a_)], key=lambda x: names.get(x, x)):
+            v = scores.get((p_, a_, j))
+            w.writerow([p_, a_, kind, it.get("bytes") if it else "", link, names.get(j, j),
+                        v if v is not None else "", YES if (p_, a_, j) in reviewed else NO,
+                        YES if ex is not None else NO, ex or "", avg, cm])
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "", re.sub(r"\s+", "_", contest["name"])) or "contest"
+    return Response("\ufeff" + buf.getvalue(), mimetype="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f"attachment; filename=\"{safe}_scores.csv\"; "
+                             f"filename*=UTF-8''{quote(contest['name'] + '_scores.csv')}"})
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
