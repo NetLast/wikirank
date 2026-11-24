@@ -39,6 +39,15 @@ def make_jury(admin_client, login="jury1", password="jurypass", name="Журі �
         "login": login, "password": password, "name": name, "role": "jury"})
 
 
+def add_jury_to_contest(admin_client, contest, *logins):
+    """Журі бачить і оцінює лише конкурси, до яких його додано (contest_jury)."""
+    admin_client.post("/admin/contest/save", data={
+        "id": contest["id"], "name": contest["name"], "template": contest["template"],
+        "projects": "\n".join(contest["projects"]), "participants": "\n".join(contest["participants"]),
+        "formula": contest["formula"], "start": contest["start"], "end": contest["end"],
+        "jury": list(logins)})
+
+
 def login_as(client, login, password):
     client.get("/logout")
     return client.post("/login", data={"login": login, "password": password})
@@ -218,7 +227,7 @@ class TestContests:
 
     def test_invalid_formula_replaced_with_default(self, admin):
         c = make_contest(admin, "Зламаний", formula="__import__('os')")
-        assert c["formula"] == "bytes / 1000 + quality * 10"
+        assert c["formula"] == ""  # некоректну формулу не зберігаємо; порожня = формула не використовується
 
     def test_edit_contest(self, admin):
         c = make_contest(admin, "До редагування")
@@ -283,6 +292,7 @@ class TestAssessment:
         c = make_contest(admin, "Середнє")
         cid = c["id"]
         make_jury(admin, "j_avg", "pw1234", "Друге Журі")
+        add_jury_to_contest(admin, c, "j_avg")
         admin.post("/api/score", json={"contest": cid, "participant": "Учасник2",
                                        "article": "Стаття А", "value": 6})
         login_as(admin, "j_avg", "pw1234")
@@ -298,6 +308,7 @@ class TestAssessment:
         c = make_contest(admin, "Формула якості")
         cid = c["id"]
         make_jury(admin, "j2", "pw1234", "Журі 2")
+        add_jury_to_contest(admin, c, "j2")
         admin.post("/api/score", json={"contest": cid, "participant": "Учасник1",
                                        "article": "Стаття А", "value": 4})
         login_as(admin, "j2", "pw1234")
@@ -451,3 +462,193 @@ def teardown_module(_):
         os.unlink(_db_path)
     except OSError:
         pass
+
+
+# ─────────────────────────────────────────────────────────────
+# Мінімум байтів для доповнень + рейтинг статей за балами журі
+# ─────────────────────────────────────────────────────────────
+class TestMinExpandAndRanking:
+    LIST = [
+        {"title": "Нова мала", "bytes": 300, "created": True},
+        {"title": "Доп велика", "bytes": 5000, "created": False},
+        {"title": "Доп мала", "bytes": 200, "created": False},
+    ]
+
+    def test_in_scope_drops_small_expansions_only(self):
+        small_exp, big_exp, small_new = self.LIST[2], self.LIST[1], self.LIST[0]
+        assert wr.in_scope(small_exp, "all", (), 0)
+        assert not wr.in_scope(small_exp, "all", (), 500)
+        assert wr.in_scope(big_exp, "all", (), 500)
+        assert wr.in_scope(small_new, "all", (), 500)        # нові не відсіюються
+        assert not wr.in_scope(small_exp, "expanded", (), 500)
+
+    def test_scope_titles_with_threshold(self):
+        r = {"perProject": {"h": {"list": self.LIST}}}
+        assert wr.scope_titles(r, "all", (), 0) is None
+        assert wr.scope_titles(r, "all", (), 500) == {"Нова мала", "Доп велика"}
+
+    def test_parse_min_expand(self):
+        assert wr.parse_min_expand("1500") == 1500
+        assert wr.parse_min_expand("-5") == 0
+        assert wr.parse_min_expand("abc") == 0
+        assert wr.parse_min_expand("") == 0
+
+    def test_kind_quality_separates_created_and_expanded(self):
+        r = {"perProject": {"h": {"list": self.LIST}}}
+        a = {"Нова мала": {"scores": {"j1": 8, "j2": 6}},
+             "Доп велика": {"scores": {"j1": 4}},
+             "Доп мала": {"scores": {"j1": 10}}}
+        kq = wr.kind_quality(a, r, "all", (), 0)
+        assert kq["created"] == (7.0, 1)
+        assert kq["expanded"] == (7.0, 2)               # (4 + 10) / 2
+        kq = wr.kind_quality(a, r, "all", (), 500)           # «Доп мала» відсіяна
+        assert kq["expanded"] == (4.0, 1)
+
+    def test_save_min_expand_and_distribute_skips_small(self, admin):
+        make_jury(admin, "jx", "jurypass", "Журі Х")
+        admin.post("/admin/contest/save", data={
+            "id": "cme", "name": "Мін доповнення", "participants": "U1",
+            "projects": "https://uk.wikivoyage.org/wiki/X", "jury": ["jx"],
+            "min_expand": "500", "review_scope": "all"})
+        with wr.app.app_context():
+            row = wr.db().execute("SELECT min_expand FROM contests WHERE id='cme'").fetchone()
+            assert row["min_expand"] == 500
+        admin.post("/api/results/cme", json={"U1": {
+            "bytes": 5500, "edits": 3, "articles": 3,
+            "perProject": {"uk.wikivoyage.org": {"bytes": 5500, "list": self.LIST}}}})
+        resp = admin.post("/api/distribute/cme", json={"per_article": 1})
+        assert resp.get_json()["items"] == 2
+        with wr.app.app_context():
+            arts = {r["article"] for r in wr.db().execute(
+                "SELECT article FROM article_assignments WHERE contest_id='cme'")}
+        assert arts == {"Нова мала", "Доп велика"}
+
+    def test_export_has_split_score_columns_and_sort(self, admin):
+        admin.post("/admin/contest/save", data={
+            "id": "cex", "name": "Експорт", "participants": "A\nB",
+            "projects": "https://uk.wikivoyage.org/wiki/X"})
+        mk = lambda b: {"bytes": b, "edits": 1, "articles": 2, "perProject": {"uk.wikivoyage.org": {
+            "bytes": b, "list": [{"title": f"n{b}", "bytes": b, "created": True},
+                                 {"title": f"e{b}", "bytes": b, "created": False}]}}}
+        admin.post("/api/results/cex", json={"A": mk(2000), "B": mk(3000)})
+        with wr.app.app_context():
+            con = wr.db()
+            for p, art, v in (("A", "n2000", 9), ("A", "e2000", 3), ("B", "n3000", 2), ("B", "e3000", 8)):
+                con.execute("INSERT INTO article_scores VALUES('cex',?,?,?,?)", (p, art, "j", v))
+            con.commit()
+        body = admin.get("/export/cex.csv?quant=1&qual=1&sort=qc").data.decode("utf-8-sig")
+        lines = body.strip().splitlines()
+        assert "Бал: нові" in lines[0] and "Бал: доповнені" in lines[0]
+        assert lines[1].split(",")[1] == "A"             # A має вищий бал за нові
+        body = admin.get("/export/cex.csv?quant=1&qual=1&sort=qe").data.decode("utf-8-sig")
+        assert body.strip().splitlines()[1].split(",")[1] == "B"
+
+
+class TestMinExpandPreview:
+    def test_preview_lists_scored_expansions_that_would_drop(self, admin):
+        admin.post("/admin/contest/save", data={
+            "id": "cpv", "name": "Прев'ю", "participants": "P",
+            "projects": "https://uk.wikivoyage.org/wiki/X"})
+        lst = [{"title": "Нова", "bytes": 50, "created": True},
+               {"title": "Мала доп", "bytes": 200, "created": False},
+               {"title": "Велика доп", "bytes": 5000, "created": False},
+               {"title": "Мала без оцінки", "bytes": 100, "created": False}]
+        admin.post("/api/results/cpv", json={"P": {"bytes": 5350, "edits": 1, "articles": 4,
+                   "perProject": {"h": {"bytes": 5350, "list": lst}}}})
+        for a in ("Нова", "Мала доп", "Велика доп"):
+            admin.post("/api/score", json={"contest": "cpv", "participant": "P", "article": a, "value": 7})
+        d = admin.get("/api/min_expand_preview/cpv?value=1000").get_json()
+        assert d["count"] == 1 and d["items"][0]["article"] == "Мала доп"   # нова й без оцінки не рахуються
+        assert admin.get("/api/min_expand_preview/cpv?value=0").get_json()["count"] == 0
+
+    def test_preview_admin_only(self, admin):
+        make_jury(admin, "jp", "jurypass", "Журі П")
+        login_as(admin, "jp", "jurypass")
+        assert admin.get("/api/min_expand_preview/cpv?value=10").status_code == 403
+
+
+class TestMinCreated:
+    def test_in_scope_min_new(self):
+        new_small = {"title": "n", "bytes": 3000, "created": True}
+        new_big = {"title": "N", "bytes": 4000, "created": True}
+        exp_small = {"title": "e", "bytes": 3000, "created": False}
+        assert not wr.in_scope(new_small, "all", (), 0, 3500)
+        assert wr.in_scope(new_big, "all", (), 0, 3500)
+        assert wr.in_scope(exp_small, "all", (), 0, 3500)          # поріг нових не діє на доповнення
+        assert not wr.in_scope(exp_small, "all", (), 3500, 0)
+        assert wr.scope_titles({"perProject": {"h": {"list": [new_small, new_big]}}}, "all", (), 0, 3500) == {"N"}
+
+    def test_save_and_distribute_with_min_created(self, admin):
+        make_jury(admin, "jm", "jurypass", "Журі М")
+        admin.post("/admin/contest/save", data={
+            "id": "cmc", "name": "Мін нова", "participants": "U", "jury": ["jm"],
+            "projects": "https://uk.wikivoyage.org/wiki/X", "min_created": "3500", "min_expand": "3500"})
+        lst = [{"title": "Нова мала", "bytes": 3000, "created": True},
+               {"title": "Нова ок", "bytes": 4000, "created": True},
+               {"title": "Доп мала", "bytes": 3000, "created": False},
+               {"title": "Доп ок", "bytes": 3600, "created": False}]
+        admin.post("/api/results/cmc", json={"U": {"bytes": 13600, "edits": 4, "articles": 4,
+                   "perProject": {"h": {"bytes": 13600, "list": lst}}}})
+        assert admin.post("/api/distribute/cmc", json={}).get_json()["items"] == 2
+        admin.post("/api/score", json={"contest": "cmc", "participant": "U", "article": "Нова ок", "value": 5})
+        d = admin.get("/api/min_expand_preview/cmc?value=3500&value_new=4500").get_json()
+        assert d["count"] == 1 and d["items"][0]["article"] == "Нова ок"   # 4000 < 4500
+        assert admin.get("/api/min_expand_preview/cmc?value=3500&value_new=3500").get_json()["count"] == 0
+        d = admin.get("/api/min_expand_preview/cmc?value=3500&value_new=3500&value_bytes=99999").get_json()
+        assert d["count"] == 1    # поріг внеску учасника теж відсіює
+
+
+class TestMinBytesConfigurable:
+    def test_default_is_off_and_configurable(self, admin):
+        make_jury(admin, "jb", "jurypass", "Журі Б")
+        for cid, mb in (("cb0", ""), ("cb1", "5000")):
+            admin.post("/admin/contest/save", data={
+                "id": cid, "name": cid, "participants": "S", "jury": ["jb"],
+                "projects": "https://uk.wikivoyage.org/wiki/X", "min_bytes": mb})
+            admin.post(f"/api/results/{cid}", json={"S": {"bytes": 2000, "edits": 1, "articles": 1,
+                       "perProject": {"h": {"bytes": 2000, "list": [{"title": "T", "bytes": 2000, "created": True}]}}}})
+        assert admin.post("/api/distribute/cb0", json={}).get_json().get("items") == 1   # без порога
+        assert admin.post("/api/distribute/cb1", json={}).status_code == 400            # 2000 < 5000
+
+
+# ── Доступність: axe-core у реальному браузері (пропускається, якщо немає playwright/axe/Chrome) ──
+class TestAccessibility:
+    AXE = os.environ.get("AXE_JS", "/home/claude/a11y/node_modules/axe-core/axe.min.js")
+
+    def _run(self, client_app, urls):
+        sync = pytest.importorskip("playwright.sync_api")
+        if not os.path.exists(self.AXE):
+            pytest.skip("axe-core не знайдено (AXE_JS)")
+        import threading
+        from werkzeug.serving import make_server
+        srv = make_server("127.0.0.1", 5077, wr.app)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        out = {}
+        try:
+            with sync.sync_playwright() as p:
+                chrome = next((c for c in ("/usr/bin/google-chrome", "/usr/bin/chromium") if os.path.exists(c)), None)
+                if not chrome:
+                    pytest.skip("Chrome не знайдено")
+                br = p.chromium.launch(executable_path=chrome, args=["--no-sandbox"])
+                pg = br.new_page()
+                pg.goto("http://127.0.0.1:5077/login")
+                pg.fill("input[name=login]", "admin")
+                pg.fill("input[name=password]", "admin")
+                pg.click("button.btn-p")
+                axe = open(self.AXE).read()
+                for u in urls:
+                    pg.goto("http://127.0.0.1:5077" + u)
+                    pg.wait_for_timeout(400)
+                    pg.evaluate(axe)
+                    r = pg.evaluate("axe.run(document,{runOnly:{type:'tag',values:['wcag2a','wcag2aa','wcag21a','wcag21aa','wcag22aa']}})")
+                    out[u] = [(v["id"], len(v["nodes"])) for v in r["violations"]]
+                br.close()
+        finally:
+            srv.shutdown()
+        return out
+
+    def test_axe_no_violations(self, client):
+        # адмін за замовчуванням створюється в init_db (admin/admin у тестовому середовищі)
+        res = self._run(client, ["/", "/?view=admin"])
+        assert all(not v for v in res.values()), res
