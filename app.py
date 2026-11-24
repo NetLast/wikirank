@@ -790,10 +790,14 @@ main{max-width:1200px;margin:0 auto;padding:20px}
 .langsw a.on{background:var(--cdx-prog-subtle);border-color:var(--cdx-prog);color:var(--cdx-prog)}
 .themebtn{padding:4px 9px;min-height:30px;font-size:14px;line-height:1.2}
 .langmenu{position:relative;display:inline-block}
-.burger{display:none;align-items:center;gap:6px;font-size:12px;padding:4px 9px;min-height:30px}
-.burger i{display:block;width:14px;height:2px;background:currentColor;box-shadow:0 -4px 0 currentColor,0 4px 0 currentColor}
-@media(max-width:820px){
- .burger{display:inline-flex}
+.burger{display:inline-flex;align-items:center;justify-content:center;padding:4px 9px;min-height:32px;min-width:36px}
+.burger svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.langmenu .langsw{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;flex-direction:column;gap:2px;min-width:180px;padding:6px;background:var(--cdx-base);border:1px solid var(--cdx-border-subtle);border-radius:var(--cdx-radius);box-shadow:var(--cdx-shadow)}
+.langmenu.open .langsw{display:flex}
+.langmenu .langsw a{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0;padding:8px 12px;min-height:36px;font-size:14px;font-weight:400;border:0;background:none;color:var(--cdx-text);border-radius:var(--cdx-radius)}
+.langmenu .langsw a:hover{background:var(--cdx-interactive);text-decoration:none}
+.langmenu .langsw a.on{background:var(--cdx-prog-subtle);color:var(--cdx-prog);font-weight:700}
+.langmenu .langsw a small{color:var(--cdx-subtle);font-size:12px}
  .langmenu .langsw{display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:50;flex-direction:column;gap:4px;padding:8px;background:var(--cdx-base);border:1px solid var(--cdx-border-subtle);border-radius:var(--cdx-radius);box-shadow:var(--cdx-shadow)}
  .langmenu.open .langsw{display:flex}
  .langmenu .langsw a{margin:0;text-align:center;min-width:64px;padding:8px 12px;font-size:13px}
@@ -848,16 +852,14 @@ function cycleTheme(){const o={auto:'light',light:'dark',dark:'auto'},n=o[themeN
 document.addEventListener('DOMContentLoaded',paintTheme);
 function toggleLang(e){e.stopPropagation();const m=e.currentTarget.parentNode;const o=m.classList.toggle('open');e.currentTarget.setAttribute('aria-expanded',o?'true':'false')}
 document.addEventListener('click',()=>document.querySelectorAll('.langmenu.open').forEach(m=>m.classList.remove('open')));
-document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.langmenu.open').forEach(m=>m.classList.remove('open'))});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.langmenu.open').forEach(m=>{m.classList.remove('open');const b=m.querySelector('.burger');if(b){b.setAttribute('aria-expanded','false');b.focus()}})});
 </script>
 <body style="display:grid;place-items:center;min-height:100vh">
 <div class="card" role="main" style="width:380px;max-width:95vw">
  <div style="display:flex;justify-content:space-between">
   <div><div class="mono" style="font-size:12px;color:var(--gold);letter-spacing:.12em">WIKI·CONTEST</div>
   <h1 style="margin:4px 0">{{t.brand}}</h1></div>
-  <div style="display:flex;gap:6px;align-items:flex-start"><button type="button" class="themebtn btn-s" onclick="cycleTheme()" data-t="{{t.theme_auto}}|{{t.theme_light}}|{{t.theme_dark}}">◐</button>  <div class="langmenu login-lm"><button type="button" class="burger" aria-label="{{l|upper}} · {{t.lang_menu}}" title="{{t.lang_menu}}" aria-expanded="false" onclick="toggleLang(event)"><i></i><span>{{l|upper}}</span></button><div class="langsw"><a href="?lang=uk" class="{{'on' if l=='uk' else ''}}" style="color:var(--ink2)">УКР</a><a
-   href="?lang=en" class="{{'on' if l=='en' else ''}}" style="color:var(--ink2)">ENG</a><a
-   href="?lang=pl" class="{{'on' if l=='pl' else ''}}" style="color:var(--ink2)">PL</a></div></div></div>
+  <div style="display:flex;gap:6px;align-items:flex-start"><button type="button" class="themebtn btn-s" onclick="cycleTheme()" data-t="{{t.theme_auto}}|{{t.theme_light}}|{{t.theme_dark}}">◐</button>  <div class="langmenu login-lm"><button type="button" class="burger btn-s" aria-label="{{t.lang_menu}}: {{l|upper}}" title="{{t.lang_menu}}" aria-expanded="false" aria-haspopup="true" onclick="toggleLang(event)"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 5h10M8 3v2M5 5c.6 3.2 3 6 6 7.5M11 5c-.6 3.2-3 6-6 7.5"/><path d="M12 20l4.5-10L21 20M13.7 16.5h5.6"/></svg></button><div class="langsw"><a href="?lang=uk" lang="uk" class="{{'on' if l=='uk' else ''}}" {{('aria-current="true"' if l=='uk' else '')|safe}}>Українська<small>УКР</small></a><a href="?lang=en" lang="en" class="{{'on' if l=='en' else ''}}" {{('aria-current="true"' if l=='en' else '')|safe}}>English<small>ENG</small></a><a href="?lang=pl" lang="pl" class="{{'on' if l=='pl' else ''}}" {{('aria-current="true"' if l=='pl' else '')|safe}}>Polski<small>PL</small></a></div></div></div>
  </div>
  <div class="hint" style="margin-bottom:12px">{{t.tagline}}</div>
  <form method="post">
@@ -888,7 +890,7 @@ function cycleTheme(){const o={auto:'light',light:'dark',dark:'auto'},n=o[themeN
 document.addEventListener('DOMContentLoaded',paintTheme);
 function toggleLang(e){e.stopPropagation();const m=e.currentTarget.parentNode;const o=m.classList.toggle('open');e.currentTarget.setAttribute('aria-expanded',o?'true':'false')}
 document.addEventListener('click',()=>document.querySelectorAll('.langmenu.open').forEach(m=>m.classList.remove('open')));
-document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.langmenu.open').forEach(m=>m.classList.remove('open'))});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.langmenu.open').forEach(m=>{m.classList.remove('open');const b=m.querySelector('.burger');if(b){b.setAttribute('aria-expanded','false');b.focus()}})});
 </script>
 <body>
 <header>
@@ -906,9 +908,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelect
  </nav>
  <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
   <button type="button" class="themebtn btn-s" onclick="cycleTheme()" data-t="{{t.theme_auto}}|{{t.theme_light}}|{{t.theme_dark}}">◐</button>
-  <span class="langmenu"><button type="button" class="burger" aria-label="{{l|upper}} · {{t.lang_menu}}" title="{{t.lang_menu}}" aria-expanded="false" onclick="toggleLang(event)"><i></i><span>{{l|upper}}</span></button><span class="langsw"><a href="?lang=uk&view={{view}}&contest={{cid or ''}}" class="{{'on' if l=='uk' else ''}}">УКР</a><a
-    href="?lang=en&view={{view}}&contest={{cid or ''}}" class="{{'on' if l=='en' else ''}}">ENG</a><a
-    href="?lang=pl&view={{view}}&contest={{cid or ''}}" class="{{'on' if l=='pl' else ''}}">PL</a></span></span>
+  <span class="langmenu"><button type="button" class="burger btn-s" aria-label="{{t.lang_menu}}: {{l|upper}}" title="{{t.lang_menu}}" aria-expanded="false" aria-haspopup="true" onclick="toggleLang(event)"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 5h10M8 3v2M5 5c.6 3.2 3 6 6 7.5M11 5c-.6 3.2-3 6-6 7.5"/><path d="M12 20l4.5-10L21 20M13.7 16.5h5.6"/></svg></button><span class="langsw"><a href="?lang=uk&view={{view}}&contest={{cid or ''}}" lang="uk" class="{{'on' if l=='uk' else ''}}" {{('aria-current="true"' if l=='uk' else '')|safe}}>Українська<small>УКР</small></a><a href="?lang=en&view={{view}}&contest={{cid or ''}}" lang="en" class="{{'on' if l=='en' else ''}}" {{('aria-current="true"' if l=='en' else '')|safe}}>English<small>ENG</small></a><a href="?lang=pl&view={{view}}&contest={{cid or ''}}" lang="pl" class="{{'on' if l=='pl' else ''}}" {{('aria-current="true"' if l=='pl' else '')|safe}}>Polski<small>PL</small></a></span></span>
   <span class="chip {{'tag-a' if me.role=='admin' else 'tag-j'}}">{{t[me.role]}}</span>
   <b>{{me.name}}</b> <a href="{{url_for('logout')}}">{{t.logout}}</a>
  </div>
