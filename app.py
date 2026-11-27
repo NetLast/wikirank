@@ -113,7 +113,7 @@ def init_db():
                        ("opt_status", "INTEGER DEFAULT 0"), ("cat_featured", "TEXT DEFAULT ''"),
                        ("cat_good", "TEXT DEFAULT ''"), ("cat_list", "TEXT DEFAULT ''"), ("src_tag", "TEXT DEFAULT ''"), ("min_expand", "INTEGER DEFAULT 0"), ("scope_refs", "INTEGER DEFAULT 0"),
                        ("scope_images", "INTEGER DEFAULT 0"), ("patrol", "INTEGER DEFAULT 0"),
-                       ("patrol_end", "TEXT DEFAULT ''")):
+                       ("patrol_end", "TEXT DEFAULT ''"), ("nom_param", "TEXT DEFAULT ''"), ("nominations", "TEXT DEFAULT ''")):
         if _col not in cols:
             con.execute(f"ALTER TABLE contests ADD COLUMN {_col} {_ddl}")
     if "min_bytes" not in cols:
@@ -693,6 +693,10 @@ _PAUTO = {'uk': {'patrol_auto_h': 'На українській вікіпеді�
 for _l, _d in _PAUTO.items():
     T[_l].update(_d)
 
+_NOM = {'uk': {'nom_param': 'Параметр спецномінації в шаблоні', 'nom_list': 'Спецномінації (за потреби)', 'nom_list_ph': 'кримськотатарська спадщина\nнові постаті = нові персоналії; постаті', 'nom_h': 'Номінацію беруть із параметра шаблону, наприклад {{…|номінація=кримськотатарська спадщина}}. Шаблон читається там, де він стоїть (стаття або сторінка обговорення). Якщо список нижче порожній, показуються всі значення, знайдені в шаблонах. Якщо заповнений: один рядок — одна номінація; після знака «=» можна вказати синоніми через «;». Кілька номінацій в одному параметрі розділяйте «;».', 'nom_title': 'Спецномінації', 'nom_h2': 'Статті, позначені в шаблоні спецномінацією, з рейтингом за середнім балом журі. Дані беруться з останньої «Перевірки внеску».', 'nom_none': 'Номінацій у даних немає. Вкажіть параметр шаблону в налаштуваннях і запустіть «Перевірити внесок» ще раз.', 'nom_articles': 'статей', 'nom_scored': 'оцінено', 'nom_avg': 'сер. бал', 'nom_csv': 'CSV (номінації)', 'tip_nom_csv': 'Вивантажити рейтинги всіх спецномінацій у CSV', 'nom_chip': 'Номінація'}, 'en': {'nom_param': 'Special-nomination parameter in the template', 'nom_list': 'Special nominations (optional)', 'nom_list_ph': 'crimean tatar heritage\nnew figures = new persons; figures', 'nom_h': 'The nomination is taken from a template parameter, e.g. {{…|номінація=crimean tatar heritage}}. The template is read where it sits (article or talk page). If the list below is empty, every value found in templates is shown. If filled: one line per nomination; after “=” you can give synonyms separated by “;”. Separate several nominations in one parameter with “;”.', 'nom_title': 'Special nominations', 'nom_h2': 'Articles marked with a special nomination in the template, ranked by average jury score. Data comes from the last “Check contribution”.', 'nom_none': 'No nominations in the data. Set the template parameter in the settings and run “Check contribution” again.', 'nom_articles': 'articles', 'nom_scored': 'scored', 'nom_avg': 'avg score', 'nom_csv': 'CSV (nominations)', 'tip_nom_csv': 'Download the rankings of all special nominations as CSV', 'nom_chip': 'Nomination'}, 'pl': {'nom_param': 'Parametr nominacji specjalnej w szablonie', 'nom_list': 'Nominacje specjalne (opcjonalnie)', 'nom_list_ph': 'dziedzictwo tatarów krymskich\nnowe postacie = nowe osoby; postacie', 'nom_h': 'Nominację bierze się z parametru szablonu, np. {{…|номінація=dziedzictwo tatarów krymskich}}. Szablon jest czytany tam, gdzie stoi (artykuł lub strona dyskusji). Jeśli lista poniżej jest pusta, pokazywane są wszystkie wartości znalezione w szablonach. Jeśli wypełniona: jeden wiersz to jedna nominacja; po „=” można podać synonimy oddzielone „;”. Kilka nominacji w jednym parametrze rozdzielaj „;”.', 'nom_title': 'Nominacje specjalne', 'nom_h2': 'Artykuły oznaczone w szablonie nominacją specjalną, z rankingiem wg średniej oceny jury. Dane pochodzą z ostatniego „Sprawdź wkład”.', 'nom_none': 'Brak nominacji w danych. Ustaw parametr szablonu w ustawieniach i uruchom „Sprawdź wkład” ponownie.', 'nom_articles': 'artykułów', 'nom_scored': 'ocenionych', 'nom_avg': 'śr. ocena', 'nom_csv': 'CSV (nominacje)', 'tip_nom_csv': 'Pobierz rankingi wszystkich nominacji specjalnych jako CSV', 'nom_chip': 'Nominacja'}}
+for _l, _d in _NOM.items():
+    T[_l].update(_d)
+
 import re as _re
 from markupsafe import Markup as _Markup, escape as _esc
 _help_n = [0]
@@ -1031,6 +1035,68 @@ function templateInfo(url){
   return{api:u.origin+'/w/api.php',title:decodeURIComponent(m[1]).replace(/_/g,' '),host:u.hostname};
  }catch(e){return null}
 }
+
+// ── Спецномінації: параметр шаблону на сторінці обговорення/статті ──
+let TPL_NOMS={};
+const OB=String.fromCharCode(123,123),CB=String.fromCharCode(125,125);
+const _nrm=x=>String(x||'').replace(/_/g,' ').trim().toLowerCase();
+function nomConfig(){
+ // рядок: «Назва = синонім1; синонім2»; повертає [{name,keys:Set}]
+ return String(CONTEST.nominations||'').split(String.fromCharCode(10)).map(l=>l.trim()).filter(Boolean).map(l=>{
+  const i=l.indexOf('='),name=(i>=0?l.slice(0,i):l).trim(),al=i>=0?l.slice(i+1).split(';'):[];
+  return{name,keys:new Set([name,...al].map(_nrm).filter(Boolean))}});
+}
+function nomCanon(v,cfg){
+ const k=_nrm(v);if(!k)return null;
+ if(!cfg.length)return String(v).trim();
+ const f=cfg.find(c=>c.keys.has(k));return f?f.name:null;
+}
+function splitTop(body){
+ const parts=[];let cur='',d=0;
+ for(let i=0;i<body.length;i++){
+  const two=body.substr(i,2);
+  if(two===OB||two==='[['){d++;cur+=two;i++;continue}
+  if(two===CB||two===']]'){d--;cur+=two;i++;continue}
+  if(body[i]==='|'&&d===0){parts.push(cur);cur=''}else cur+=body[i];
+ }
+ parts.push(cur);return parts;
+}
+function parseNoms(text,tplTitle,param){
+ const want=_nrm(String(tplTitle).replace(/^[^:]+:/,'')),pk=_nrm(param||'номінація'),out=[];
+ let i=0;
+ while((i=text.indexOf(OB,i))>=0){
+  let d=0,j=i;
+  for(;j<text.length-1;j++){
+   const two=text.substr(j,2);
+   if(two===OB){d++;j++}else if(two===CB){d--;j++;if(d===0)break}
+  }
+  const parts=splitTop(text.slice(i+2,Math.max(i+2,j-1)));
+  if(_nrm(String(parts[0]).replace(/^[^:]+:/,''))===want||_nrm(parts[0])===want){
+   parts.slice(1).forEach(pt=>{const e=pt.indexOf('=');if(e<0)return;
+    if(_nrm(pt.slice(0,e))===pk)pt.slice(e+1).split(';').forEach(v=>{const t=v.trim();if(t)out.push(t)})});
+  }
+  i+=2;
+ }
+ return out;
+}
+async function loadNoms(tp,raw,talkPfx){
+ TPL_NOMS={};if(!raw.length)return;
+ const cfg=nomConfig();
+ for(let i=0;i<raw.length;i+=20){
+  const chunk=raw.slice(i,i+20);
+  try{
+   const d=await mw(tp.api,{action:'query',prop:'revisions',rvprop:'content',rvslots:'main',titles:chunk.map(x=>x.title).join('|')});
+   Object.values(d.query?.pages||{}).forEach(pg=>{
+    const txt=(pg.revisions&&pg.revisions[0]&&pg.revisions[0].slots&&pg.revisions[0].slots.main&&(pg.revisions[0].slots.main['*']||pg.revisions[0].slots.main.content))||'';
+    if(!txt)return;
+    const art=pg.ns===1?pg.title.slice(talkPfx.length):pg.title;
+    const vals=parseNoms(txt,tp.title,CONTEST.nom_param).map(v=>nomCanon(v,cfg)).filter(Boolean);
+    if(vals.length)TPL_NOMS[art]=[...new Set((TPL_NOMS[art]||[]).concat(vals))];
+   });
+  }catch(e){}
+  await sleep(120);
+ }
+}
 // офіційні конкурсні статті за шаблоном (з урахуванням "лише обговорення")
 async function templatePages(tp,talkOnly){
  let cont=null,raw=[],g=0;
@@ -1042,6 +1108,7 @@ async function templatePages(tp,talkOnly){
  const talkPfx=(nsd.query?.namespaces?.['1']?.['*']||'Talk')+':';
  const pageSet=new Set();
  raw.forEach(x=>pageSet.add(x.ns===1?x.title.slice(talkPfx.length):x.title));
+ try{await loadNoms(tp,raw,talkPfx)}catch(e){TPL_NOMS={}}
  return[...pageSet];
 }
 // повна історія редагувань статті з обчисленим приростом байтів на редагування
@@ -1393,7 +1460,7 @@ async function runCheck(){
  Object.values(out).forEach(row=>{
   const pp=row.perProject[tplHost];
   if(pp&&pp._detail){
-   pp.list=Object.entries(pp._detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created,_e:d._e,_te:d._te}))
+   pp.list=Object.entries(pp._detail).map(([title,d])=>({title,bytes:d.bytes,created:d.created,_e:d._e,_te:d._te,...(TPL_NOMS[title]?{noms:TPL_NOMS[title]}:{})}))
     .sort((a,b2)=>b2.bytes-a.bytes);
    pp.articles=pp._titles.size;delete pp._detail;delete pp._titles;
   }
@@ -1511,26 +1578,72 @@ function exportTop(){
  a.href=URL.createObjectURL(new Blob([String.fromCharCode(0xFEFF)+lines.join(NL)],{type:'text/csv;charset=utf-8'}));
  a.download='top-articles-'+CID+'.csv';document.body.appendChild(a);a.click();a.remove();
 }
+function topCol(lbl,list,clr,mx){
+ let h='<div style="flex:1;min-width:300px"><div class="lbl" style="margin:0 0 6px;color:'+clr+'">'+esc(lbl)+' <span class="hint">('+list.length+')</span></div>';
+ if(!list.length)return h+'<div class="hint">'+esc(T.top_none)+'</div></div>';
+ list.slice(0,TOPN).forEach((x,i)=>{
+  h+='<div style="display:grid;grid-template-columns:22px 1fr 44px;gap:8px;align-items:center;padding:3px 0">'
+   +'<span class="mono hint">'+(i+1)+'</span><div style="min-width:0">'
+   +'<a class="wl" target="_blank" rel="noopener" href="'+articleLink(x.origin,x.title)+'" style="display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(x.title)+'</a>'
+   +'<div class="hint" style="">'+esc(x.user)+' · +'+fmtN(x.bytes)+BU+' · '+x.n+' '+esc(T.scores_n)+'</div>'
+   +'<div class="bar"><i style="width:'+(x.avg/mx*100)+'%;background:'+clr+'"></i></div></div>'
+   +'<span class="mono" style="font-weight:700;text-align:right">'+x.avg.toFixed(2)+'</span></div>'});
+ return h+'</div>'}
 function topHtml(rows){
  TOP_ROWS=rows;
  const tp=topArticles(rows);
  const mx=Math.max(1,...tp.created.concat(tp.expanded).map(x=>x.avg));
- const col=(lbl,list,clr)=>{
-  let h='<div style="flex:1;min-width:300px"><div class="lbl" style="margin:0 0 6px;color:'+clr+'">'+esc(lbl)+' <span class="hint">('+list.length+')</span></div>';
-  if(!list.length)return h+'<div class="hint">'+esc(T.top_none)+'</div></div>';
-  list.slice(0,TOPN).forEach((x,i)=>{
-   h+='<div style="display:grid;grid-template-columns:22px 1fr 44px;gap:8px;align-items:center;padding:3px 0">'
-    +'<span class="mono hint">'+(i+1)+'</span><div style="min-width:0">'
-    +'<a class="wl" target="_blank" rel="noopener" href="'+articleLink(x.origin,x.title)+'" style="display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(x.title)+'</a>'
-    +'<div class="hint" style="">'+esc(x.user)+' · +'+fmtN(x.bytes)+BU+' · '+x.n+' '+esc(T.scores_n)+'</div>'
-    +'<div class="bar"><i style="width:'+(x.avg/mx*100)+'%;background:'+clr+'"></i></div></div>'
-    +'<span class="mono" style="font-weight:700;text-align:right">'+x.avg.toFixed(2)+'</span></div>'});
-  return h+'</div>'};
+ const col=(lbl,list,clr)=>topCol(lbl,list,clr,mx);
  let h='<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px"><h2 style="margin:0">'+esc(T.top_title)+'</h2>'
   +'<span style="flex:1 1 260px">'+hintHelp(T.top_h)+'</span><span style="margin-left:auto;display:flex;gap:10px;align-items:center" class="hint"><button class="btn-s" style="padding:4px 10px;font-size:12px" title="'+esc(T.tip_top_csv)+'" onclick="exportTop()">'+esc(T.top_csv)+'</button>'+esc(T.top_show)+' <select aria-label="'+esc(T.top_show)+'" onchange="setTopN(this.value)" style="width:auto;padding:2px 6px">'
   +[5,10,25,50].map(n=>'<option value="'+n+'"'+(n===TOPN?' selected':'')+'>'+n+'</option>').join('')+'</select></span></div>';
  h+='<div style="display:flex;flex-wrap:wrap;gap:24px">'+col(T.top_created,tp.created,'var(--cdx-ok-text)')+col(T.top_expanded,tp.expanded,'var(--acc)')+'</div>';
  return h;
+}
+
+// рейтинги за спецномінаціями (адмін): така сама логіка, як у «Найвищих балах журі»
+function nomData(rows){
+ const m=new Map();
+ rows.forEach(row=>projects.forEach(p=>{
+  const pp=row.r?row.r.perProject[p.host]:null;
+  (pp&&pp.list?pp.list:[]).filter(inScope).forEach(it=>(it.noms||[]).forEach(n=>{
+   let e=m.get(n);if(!e){e={name:n,total:0,created:[],expanded:[]};m.set(n,e)}
+   e.total++;
+   const vals=Object.values(slot(row.user,it.title).scores||{}).filter(v=>v!=null);
+   if(!vals.length)return;
+   e[it.created?'created':'expanded'].push({user:row.user,title:it.title,origin:p.origin,bytes:it.bytes,avg:vals.reduce((x,y)=>x+y,0)/vals.length,n:vals.length});
+  }))}));
+ const cmp=(a,b)=>(b.avg-a.avg)||(b.n-a.n)||(b.bytes-a.bytes);
+ const cfgOrder=nomConfig().map(c=>c.name);
+ return[...m.values()].map(e=>{e.created.sort(cmp);e.expanded.sort(cmp);
+  const all=e.created.concat(e.expanded);e.scored=all.length;e.avg=all.length?all.reduce((x,y)=>x+y.avg,0)/all.length:null;return e})
+  .sort((a,b)=>{const ia=cfgOrder.indexOf(a.name),ib=cfgOrder.indexOf(b.name);
+   return (ia<0?999:ia)-(ib<0?999:ib)||a.name.localeCompare(b.name)});
+}
+function nomHtml(rows){
+ NOM_ROWS=rows;
+ const data=nomData(rows);
+ let h='<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px"><h2 style="margin:0">'+esc(T.nom_title)+'</h2>'
+  +'<span style="flex:1 1 260px">'+hintHelp(T.nom_h2)+'</span>'
+  +'<button class="btn-s" style="padding:4px 10px;font-size:12px;margin-left:auto" title="'+esc(T.tip_nom_csv)+'" onclick="exportNoms()">'+esc(T.nom_csv)+'</button></div>';
+ if(!data.length)return h+'<div class="hint">'+esc(T.nom_none)+'</div>';
+ data.forEach(e=>{
+  const mx=Math.max(1,...e.created.concat(e.expanded).map(x=>x.avg));
+  h+='<details open style="margin:10px 0;padding-top:8px;border-top:1px solid var(--cdx-border-subtle)"><summary style="cursor:pointer;min-height:24px"><b>'+esc(e.name)+'</b> <span class="hint">· '+e.total+' '+esc(T.nom_articles)+' · '+e.scored+' '+esc(T.nom_scored)+(e.avg!=null?' · '+esc(T.nom_avg)+' '+e.avg.toFixed(2):'')+'</span></summary>'
+   +'<div style="display:flex;flex-wrap:wrap;gap:24px;margin-top:6px">'+topCol(T.top_created,e.created,'var(--cdx-ok-text)',mx)+topCol(T.top_expanded,e.expanded,'var(--acc)',mx)+'</div></details>';
+ });
+ return h;
+}
+let NOM_ROWS=[];
+function exportNoms(){
+ const data=nomData(NOM_ROWS),NL=String.fromCharCode(13,10);
+ const q=v=>'"'+String(v).replace(/"/g,'""')+'"';
+ const lines=[[T.nom_chip,'#',T.top_c_type,T.top_c_article,T.th_u,T.th_b,T.top_c_score,T.top_c_n,T.top_c_link].map(q).join(',')];
+ data.forEach(e=>[['created',T.created],['expanded',T.expanded]].forEach(([k,lbl])=>e[k].forEach((x,i)=>
+  lines.push([e.name,i+1,lbl,x.title,x.user,x.bytes,x.avg.toFixed(2),x.n,articleLink(x.origin,x.title)].map(q).join(',')))));
+ const a=document.createElement('a');
+ a.href=URL.createObjectURL(new Blob([String.fromCharCode(0xFEFF)+lines.join(NL)],{type:'text/csv;charset=utf-8'}));
+ a.download='nominations-'+CID+'.csv';document.body.appendChild(a);a.click();a.remove();
 }
 function legacyDone(user){const l=LEGACY[user];return !!(l&&(Object.keys(l.scores||{}).length||(l.comments||[]).length))}
 function legacyVals(user){const l=LEGACY[user];return l?Object.values(l.scores||{}).filter(v=>v!=null):[]}
@@ -2164,6 +2277,7 @@ function render(){
       if(CONTEST.opt_refs&&it.refs!=null)h+='<span class="chip" style="font-size:12px" title="'+esc(T.tip_chip_refs)+'">'+T.chip_refs+' +'+it.refs+'</span>';
       if(CONTEST.opt_images&&it.images!=null)h+='<span class="chip" style="font-size:12px" title="'+esc(T.tip_chip_images)+'">'+T.chip_images+' +'+it.images+'</span>';
       if(it.st)h+='<span class="chip" style="font-size:12px;background:var(--cdx-warn-subtle);color:var(--cdx-warn)">'+(it.st==='featured'?T.status_featured:(it.st==='list'?T.status_list:T.status_good))+'</span>';
+      (it.noms||[]).forEach(n=>{h+='<span class="chip" title="'+esc(T.nom_chip)+'">★ '+esc(n)+'</span>'});
       if(ad.excluded)h+='<span class="chip" style="background:var(--cdx-warn-subtle);color:var(--cdx-warn)" title="'+esc(ad.excluded.reason)+'">'+esc(T.excl_badge)+'</span>';
       if(mine)h+='<span class="chip tag-a" style="font-size:12px">'+T.mine+'</span>';
       if(avg!=null)h+='<span class="chip" style="font-size:12px;background:var(--cdx-warn-subtle);color:var(--cdx-warn)">★ '+avg.toFixed(1)+'</span>';
@@ -2186,6 +2300,8 @@ function render(){
   h+='<div class="hint" style="padding:8px 12px">'+T.hidden_exp+' ('+fmtN(MIN_NEW)+' / '+fmtN(MIN_EXP)+BU+'): '+hiddenE+'</div>';
  }
  el.innerHTML=h;
+ const nbx=document.getElementById('nombox');
+ if(nbx){if(QUAL&&!IS_JURY){nbx.style.display='block';nbx.innerHTML=nomHtml(rows)}else{nbx.style.display='none';nbx.innerHTML=''}}
  const ab=document.getElementById('attnbox');
  if(ab){if(QUAL&&!IS_JURY){ab.style.display='block';ab.innerHTML=attnHtml(rows)}else{ab.style.display='none';ab.innerHTML=''}}
  const tb=document.getElementById('topbox');
@@ -2232,6 +2348,13 @@ ADMIN_TPL = """
      <input type="checkbox" id="tplTalkOnly" name="tpl_talk_only" style="width:auto"
       {{'checked' if edit_contest and edit_contest.tpl_talk_only else ''}}> {{t.tpl_talk_only}}
     </label>
+    <div style="margin-top:10px">
+     <label class="lbl" style="margin-top:0" for="nomParam">{{t.nom_param}}</label>
+     <input id="nomParam" name="nom_param" class="mono" style="font-size:12px" maxlength="60" value="{{edit_contest.nom_param if edit_contest else ''}}" placeholder="номінація">
+     <label class="lbl" for="nomList">{{t.nom_list}}</label>
+     <textarea id="nomList" name="nominations" rows="3" class="mono" style="font-size:12px" placeholder="{{t.nom_list_ph}}">{{edit_contest.nominations if edit_contest else ''}}</textarea>
+     <div style="margin-top:4px">{{hint_help(t.nom_h)}}</div>
+    </div>
     <div style="margin-top:8px;display:flex;gap:10px;align-items:center">
      <button type="button" id="extbtn" class="btn-p" title="{{t.tip_tpl_btn}}" onclick="extractParticipants()">{{t.tpl_btn}}</button>
      <label class="hint" title="{{t.tip_replace}}" style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="tplReplace" checked style="width:auto"> {{t.tpl_replace}}</label>
@@ -2443,6 +2566,7 @@ ANALYSIS_TPL = """
 </div>
 <div class="card" style="padding:0;overflow-x:auto"><div id="tbl"></div></div>
 <div id="topbox" class="card" style="display:none"></div>
+<div id="nombox" class="card" style="display:none"></div>
 <div id="attnbox" class="card" style="display:none"></div>
 <div class="hint">{% if me.role=='admin' %}{{t.f_of}} <span class="chip">{{contest.formula if contest.formula else '—'}}</span> · {% endif %}{{t.scope_label}} <span class="chip">{{t['scope_'~(contest.review_scope or 'all')]}}</span>{% if contest.min_bytes %} · {{t.min_bytes_chip}} <span class="chip">{{contest.min_bytes}} {{t.bytes_unit}}</span>{% endif %}{% if contest.min_created %} · {{t.min_created_chip}} <span class="chip">{{contest.min_created}} {{t.bytes_unit}}</span>{% endif %}{% if contest.min_expand %} · {{t.min_expand_chip}} <span class="chip">{{contest.min_expand}} {{t.bytes_unit}}</span>{% endif %}</div>
 {% endif %}
@@ -2765,8 +2889,8 @@ def contest_save():
     scope_refs, scope_images = chk("scope_refs"), chk("scope_images")
     db().execute("""INSERT INTO contests(id,name,template,projects,participants,formula,start,end,
         tpl_talk_only,review_scope,opt_refs,opt_images,opt_status,cat_featured,cat_good,cat_list,src_tag,min_expand,
-        scope_refs,scope_images,patrol,patrol_end,min_created,min_bytes)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        scope_refs,scope_images,patrol,patrol_end,min_created,min_bytes,nom_param,nominations)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET name=excluded.name,template=excluded.template,
         projects=excluded.projects,participants=excluded.participants,
         formula=excluded.formula,start=excluded.start,end=excluded.end,
@@ -2775,7 +2899,8 @@ def contest_save():
         cat_featured=excluded.cat_featured,cat_good=excluded.cat_good,cat_list=excluded.cat_list,src_tag=excluded.src_tag,min_expand=excluded.min_expand,
         scope_refs=excluded.scope_refs,scope_images=excluded.scope_images,
         patrol=excluded.patrol,patrol_end=excluded.patrol_end,
-        min_created=excluded.min_created,min_bytes=excluded.min_bytes""",
+        min_created=excluded.min_created,min_bytes=excluded.min_bytes,
+        nom_param=excluded.nom_param,nominations=excluded.nominations""",
         (cid, f.get("name", "").strip(), f.get("template", "").strip(),
          json.dumps(projects), json.dumps(participants), formula,
          f.get("start", ""), f.get("end", ""), chk("tpl_talk_only"), scope,
@@ -2783,7 +2908,8 @@ def contest_save():
          f.get("cat_featured", "").strip(), f.get("cat_good", "").strip(),
          f.get("cat_list", "").strip(), f.get("src_tag", "").strip(), min_expand,
          scope_refs, scope_images, chk("patrol"), f.get("patrol_end", "").strip(),
-         min_created, min_bytes))
+         min_created, min_bytes, f.get("nom_param", "").strip()[:60],
+         "\n".join(x.strip() for x in f.get("nominations", "").splitlines() if x.strip())[:2000]))
     # журі конкурсу: оновлюємо лише склад; оцінки, перевірки та призначення не чіпаємо
     valid = {r["login"] for r in db().execute("SELECT login FROM users WHERE role='jury'")}
     chosen = [j for j in f.getlist("jury") if j in valid]
@@ -3274,11 +3400,11 @@ def export_scores(cid):
     l = lang()
     H = {
         "uk": ["Учасник", "Стаття", "Тип", "Додано байтів", "Посилання", "Член журі", "Оцінка",
-               "Перевірено", "Не зараховується", "Причина", "Середній бал статті", "Коментарі журі"],
+               "Перевірено", "Не зараховується", "Причина", "Середній бал статті", "Коментарі журі", "Спецномінації"],
         "en": ["Participant", "Article", "Type", "Bytes added", "Link", "Jury member", "Score",
-               "Reviewed", "Not counted", "Reason", "Article average", "Jury comments"],
+               "Reviewed", "Not counted", "Reason", "Article average", "Jury comments", "Special nominations"],
         "pl": ["Uczestnik", "Artykuł", "Typ", "Dodane bajty", "Link", "Juror", "Ocena",
-               "Sprawdzony", "Niezaliczony", "Powód", "Średnia artykułu", "Komentarze jury"],
+               "Sprawdzony", "Niezaliczony", "Powód", "Średnia artykułu", "Komentarze jury", "Nominacje specjalne"],
     }[l]
     YES, NO = {"uk": ("так", "ні"), "en": ("yes", "no"), "pl": ("tak", "nie")}[l]
     KIND = {"uk": ("створено", "доповнено"), "en": ("created", "expanded"), "pl": ("utworzony", "rozbudowany")}[l]
@@ -3319,7 +3445,8 @@ def export_scores(cid):
             v = scores.get((p_, a_, j))
             w.writerow([p_, a_, kind, it.get("bytes") if it else "", link, names.get(j, j),
                         v if v is not None else "", YES if (p_, a_, j) in reviewed else NO,
-                        YES if ex is not None else NO, ex or "", avg, cm])
+                        YES if ex is not None else NO, ex or "", avg, cm,
+                        "; ".join(it.get("noms") or []) if it else ""])
     safe = re.sub(r"[^A-Za-z0-9_\-]", "", re.sub(r"\s+", "_", contest["name"])) or "contest"
     return Response("\ufeff" + buf.getvalue(), mimetype="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f"attachment; filename=\"{safe}_scores.csv\"; "
